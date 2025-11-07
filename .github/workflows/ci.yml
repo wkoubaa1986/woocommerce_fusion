@@ -1,0 +1,132 @@
+
+name: CI
+
+on:
+  push:
+    branches:
+      - version-15
+  pull_request:
+
+concurrency:
+  group: develop-woocommerce_fusion-${{ github.event.number }}
+  cancel-in-progress: true
+
+env:
+  TEST_AGAINST_FRAPPE_VERSION: v15.70.0
+  TEST_AGAINST_ERPNEXT_VERSION: v15.57.5
+
+jobs:
+  tests:
+    runs-on: ubuntu-22.04 
+    strategy:
+      fail-fast: false
+    name: Backend Unit Tests & UI Tests
+
+    services:
+      mariadb:
+        image: mariadb:10.11
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: --health-cmd="mysqladmin ping" --health-interval=5s --health-timeout=2s --health-retries=3
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: |
+              3.10
+
+      - name: Setup Node
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+          check-latest: true
+
+      - name: Cache pip
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/*requirements.txt', '**/pyproject.toml', '**/setup.py', '**/setup.cfg') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+            ${{ runner.os }}-
+
+      - name: Get yarn cache directory path
+        id: yarn-cache-dir-path
+        run: echo "dir=$(yarn cache dir)" >> $GITHUB_OUTPUT
+
+      - name: Cache yarn
+        uses: actions/cache@v3
+        id: yarn-cache
+        with:
+          path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
+          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+              name: InstaWP WordPress Testing
+
+      -   name: Create InstaWP instance
+          uses: instawp/wordpress-testing-automation@main
+          id: create-instawp
+          continue-on-error: true # To avoid "Error: Resource not accessible by integration"
+          with:
+              GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              INSTAWP_TOKEN: ${{ secrets.INSTAWP_TOKEN }}
+              INSTAWP_TEMPLATE_SLUG: woocommerce-with-tax-and-variants
+              REPO_ID: 291
+              INSTAWP_ACTION: create-site-template
+
+      -   name: Extract InstaWP domain
+          id: extract-instawp-domain                
+          run: |
+              # Check step to ensure instawp_url is not empty
+              if [[ -z "${{ steps.create-instawp.outputs.instawp_url }}" ]]; then
+                echo "instawp_url is empty. Failing the job."
+                exit 1
+              else
+                echo "instawp_url exists: ${{ steps.create-instawp.outputs.instawp_url }}"
+              fi
+
+              instawp_domain="$(echo "${{ steps.create-instawp.outputs.instawp_url }}" | sed -e s#https://##)"
+              echo "instawp-domain=$(echo $instawp_domain)" >> $GITHUB_OUTPUT
+
+      - name: Install
+        run: |
+          bash ${GITHUB_WORKSPACE}/.github/helper/install.sh
+
+      - name: Run Tests
+        working-directory: /home/runner/frappe-bench
+        run: |
+          bench --site test_site set-config allow_tests true
+          bench --site test_site run-tests --app woocommerce_fusion --coverage
+        env:
+          TYPE: server
+          WOO_INTEGRATION_TESTS_WEBSERVER: ${{ steps.create-instawp.outputs.instawp_url }}
+          WOO_API_CONSUMER_KEY: ${{ secrets.WOO_API_CONSUMER_KEY }}
+          WOO_API_CONSUMER_SECRET: ${{ secrets.WOO_API_CONSUMER_SECRET }}
+
+      - name: Destroy InstaWP instance
+        uses: instawp/wordpress-testing-automation@main
+        id: destroy-instawp
+        if: ${{ always() }}
+        with:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INSTAWP_TOKEN: ${{ secrets.INSTAWP_TOKEN }}    
+          INSTAWP_TEMPLATE_SLUG: woocommerce-with-tax-and-variants
+          REPO_ID: 291
+          INSTAWP_ACTION: destroy-site
+
+      - name: Upload coverage data
+        uses: codecov/codecov-action@v3
+        with:
+          name: Backend
+          token: ${{ secrets.CODECOV_TOKEN }}
+          # fail_ci_if_error: true
+          files: /home/runner/frappe-bench/sites/coverage.xml
+          verbose: true
