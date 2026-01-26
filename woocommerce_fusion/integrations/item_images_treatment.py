@@ -1412,7 +1412,7 @@ def _dhash_of_media(m: dict, cache: dict):
 
 @frappe.whitelist()
 def dedupe_item_images(item_name: str, dry_run: bool = True, detach_missing: bool = False,
-                      use_dhash: bool = True, dhash_threshold: int = 4):
+                      use_dhash: bool = True, dhash_threshold: int = 8):
 
     item, media = _list_item_media(item_name)
 
