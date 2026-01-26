@@ -21,7 +21,8 @@ from woocommerce_fusion.woocommerce.doctype.woocommerce_order.woocommerce_order 
 from woocommerce_fusion.woocommerce.woocommerce_api import (
 	generate_woocommerce_record_name_from_domain_and_id,
 )
-
+from collections import defaultdict
+import pdb
 
 def run_sales_order_sync_from_hook(doc, method):
 	if (
@@ -43,6 +44,7 @@ def run_sales_order_sync(
 	"""
 	Helper funtion that prepares arguments for order sync
 	"""
+
 	# Validate inputs, at least one of the parameters should be provided
 	if not any([sales_order_name, sales_order, woocommerce_order_name, woocommerce_order]):
 		raise ValueError(
@@ -81,13 +83,12 @@ def run_sales_order_sync(
 		sync.woocommerce_order if sync else None,
 	)
 
-
+@frappe.whitelist()
 def sync_woocommerce_orders_modified_since(date_time_from=None):
 	"""
 	Get list of WooCommerce orders modified since date_time_from
 	"""
 	wc_settings = frappe.get_doc("WooCommerce Integration Settings")
-
 	if not date_time_from:
 		date_time_from = wc_settings.wc_last_sync_date
 
@@ -133,6 +134,7 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		"""
 		Run synchronisation
 		"""
+
 		try:
 			self.get_corresponding_sales_order_or_woocommerce_order()
 			self.sync_wc_order_with_erpnext_order()
@@ -195,6 +197,7 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		"""
 		Syncronise Sales Order between ERPNext and WooCommerce
 		"""
+
 		if self.sales_order and not self.woocommerce_order:
 			# create missing order in WooCommerce
 			pass
@@ -366,7 +369,6 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		Update the WooCommerce Order with fields from it's corresponding ERPNext Sales Order
 		"""
 		wc_order_dirty = False
-
 		# Update the woocommerce_status field if necessary
 		sales_order_wc_status = (
 			WC_ORDER_STATUS_MAPPING[sales_order.woocommerce_status]
@@ -378,12 +380,16 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 			wc_order_dirty = True
 
 		# Get the Item WooCommerce ID's
+		Nb_sales_order_items = 0
 		for so_item in sales_order.items:
 			so_item.woocommerce_id = frappe.get_value(
 				"Item WooCommerce Server",
 				filters={"parent": so_item.item_code, "woocommerce_server": wc_order.woocommerce_server},
 				fieldname="woocommerce_id",
 			)
+			if so_item.item_code in ["Liv"]:
+				continue
+			Nb_sales_order_items += 1
 
 		# Update the line_items field if necessary
 		wc_server = frappe.get_cached_doc("WooCommerce Server", wc_order.woocommerce_server)
@@ -391,11 +397,12 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 			sales_order_items_changed = False
 			line_items = json.loads(wc_order.line_items)
 			# Check if count of line items are different
-			if len(line_items) != len(sales_order.items):
+			if len(line_items) != Nb_sales_order_items:
 				sales_order_items_changed = True
 			# Check if any line item properties changed
 			else:
 				for i, so_item in enumerate(sales_order.items):
+					
 					if not so_item.woocommerce_id:
 						break
 					elif (
@@ -478,7 +485,6 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		"""
 		customer_docname = self.create_or_link_customer_and_address(wc_order)
 		self.create_missing_items(wc_order, json.loads(wc_order.line_items), wc_order.woocommerce_server)
-
 		new_sales_order = frappe.new_doc("Sales Order")
 		self.sales_order = new_sales_order
 		new_sales_order.customer = customer_docname
@@ -487,7 +493,6 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 
 		new_sales_order.woocommerce_status = WC_ORDER_STATUS_MAPPING_REVERSE[wc_order.status]
 		wc_server = frappe.get_cached_doc("WooCommerce Server", wc_order.woocommerce_server)
-
 		new_sales_order.woocommerce_server = wc_order.woocommerce_server
 		# Set the payment_method_title field if necessary, use the payment method ID if the title field is too long
 		payment_method = (
@@ -498,11 +503,12 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		new_sales_order.woocommerce_payment_method = payment_method
 		created_date = wc_order.date_created.split("T")
 		new_sales_order.transaction_date = created_date[0]
-		delivery_after = wc_server.delivery_after_days or 7
+		# delivery_after = wc_server.delivery_after_days or 7
+		delivery_after = 1
 		new_sales_order.delivery_date = frappe.utils.add_days(created_date[0], delivery_after)
 		new_sales_order.company = wc_server.company
 		new_sales_order.currency = wc_order.currency
-
+		
 		if (
 			(wc_server.enable_shipping_methods_sync)
 			and (shipping_lines := json.loads(wc_order.shipping_lines))
@@ -535,6 +541,7 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		"""
 		Create or update Customer and Address records, with special handling for guest orders using order ID.
 		"""
+		
 		raw_billing_data = json.loads(wc_order.billing)
 		raw_shipping_data = json.loads(wc_order.shipping)
 		first_name = raw_billing_data.get("first_name", "").strip()
@@ -679,7 +686,7 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 				"rate": item.get("price")
 				if wc_server.use_actual_tax_type or not tax_template.taxes[0].included_in_print_rate
 				else get_tax_inc_price_for_woocommerce_line_item(item),
-				"warehouse": wc_server.warehouse,
+				# "warehouse": wc_server.warehouse,
 				"discount_percentage": 100 if item.get("price") == 0 else 0,
 			}
 
@@ -702,15 +709,43 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 
 		# If a Shipping Rule is added, shipping charges will be determined by the Shipping Rule. If not, then
 		# get it from the WooCommerce Order
-		if not new_sales_order.shipping_rule:
-			add_tax_details(new_sales_order, wc_order.shipping_tax, "Shipping Tax", wc_server.f_n_f_account)
-			add_tax_details(
-				new_sales_order,
-				wc_order.shipping_total,
-				"Shipping Total",
-				wc_server.f_n_f_account,
+		# if not new_sales_order.shipping_rule:
+		# 	add_tax_details(new_sales_order, wc_order.shipping_tax, "Shipping Tax", wc_server.f_n_f_account)
+		# 	add_tax_details(
+		# 		new_sales_order,
+		# 		wc_order.shipping_total,
+		# 		"Shipping Total",
+		# 		wc_server.f_n_f_account,
+		# 	)
+		if wc_order.shipping_total:
+			installation= False
+			shipping_lines = json.loads(wc_order.shipping_lines)	
+			if shipping_lines and len(shipping_lines)>0 and shipping_lines[0]['method_title']=='Livraison avec Installation':
+				installation= True
+			if installation:
+				new_sales_order_line = {
+					"item_code": "M-I-OD",
+					"item_name": "Installation Osmoseur domestique",
+					"delivery_date": new_sales_order.delivery_date,
+					"qty": 1,
+					"rate": wc_order.shipping_total,
+					"discount_percentage": 100 if float(wc_order.shipping_total) == 0 else 0,
+				}
+			else:
+				new_sales_order_line = {
+					"item_code": "Liv",
+					"item_name": "Livraison",
+					"delivery_date": new_sales_order.delivery_date,
+					"qty": 1,
+					"rate": wc_order.shipping_total,
+					"discount_percentage": 100 if float(wc_order.shipping_total) == 0 else 0,
+				}
+			new_sales_order.append(
+				"items",
+				new_sales_order_line,
 			)
-
+		new_sales_order.payment_terms_template = "Livraison Aramex"
+		new_sales_order.custom_type_de_transaction = "Autre"
 		# Handle scenario where Woo Order has no items, then manually set the total
 		if len(new_sales_order.items) == 0:
 			new_sales_order.base_grand_total = float(wc_order.total)
@@ -822,7 +857,7 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 			True if raw_billing_data[key] == raw_shipping_data[key] else False
 			for key in address_keys_to_compare
 		]
-
+		
 		if all(address_keys_same):
 			# Use one address for both billing and shipping
 			address = existing_billing_address or existing_shipping_address
@@ -981,24 +1016,42 @@ def create_contact(data, customer):
 	if not email and not phone:
 		return
 
-	contact = frappe.new_doc("Contact")
-	contact.first_name = data.get("first_name")
-	contact.last_name = data.get("last_name")
-	contact.is_primary_contact = 1
-	contact.is_billing_contact = 1
+	
+	contacts = get_contacts_linking_to("Customer", customer.name, fields=["name", "first_name", "email_ids", "phone_nos"])
+	create= True
+	for contact in contacts:
+		contact_email_ids = [email.email_id for email in contact.get("email_ids", [])]
+		contact_phone_nos = [phone.phone for phone in contact.get("phone_nos", [])]
 
-	if phone:
-		contact.add_phone(phone, is_primary_mobile_no=1, is_primary_phone=1)
+		if (phone and phone in contact_phone_nos):
+			create = False
+			break
+	if not create:
+		contact = frappe.get_doc("Contact", contact.name)
+		if email and email not in contact_email_ids:
+			contact.add_email(email, is_primary=1)
+			contact.flags.ignore_mandatory = True
+			contact.save()
+		return contact
+	else:
+		contact = frappe.new_doc("Contact")
+		contact.first_name = data.get("first_name")
+		contact.last_name = data.get("last_name")
+		contact.is_primary_contact = 1
+		contact.is_billing_contact = 1
 
-	if email:
-		contact.add_email(email, is_primary=1)
+		if phone:
+			contact.add_phone(phone, is_primary_mobile_no=1, is_primary_phone=1)
 
-	contact.append("links", {"link_doctype": "Customer", "link_name": customer.name})
+		if email:
+			contact.add_email(email, is_primary=1)
 
-	contact.flags.ignore_mandatory = True
-	contact.save()
+		contact.append("links", {"link_doctype": "Customer", "link_name": customer.name})
 
-	return contact
+		contact.flags.ignore_mandatory = True
+		contact.save()
+
+		return contact
 
 
 def add_tax_details(sales_order, price, desc, tax_account_head):
@@ -1055,3 +1108,97 @@ def get_addresses_linking_to(doctype, docname, fields=None):
 			["Dynamic Link", "link_name", "=", docname],
 		],
 	)
+def _existing_fields(dt, wanted):
+	"""Keep only fields that exist in DocType dt (robust across versions/customizations)."""
+	meta = frappe.get_meta(dt)
+	existing = {df.fieldname for df in meta.fields}
+	return [f for f in wanted if f in existing]
+
+def get_contacts_linking_to(doctype, docname, fields=None):
+	"""Return a list of Contacts containing a link to the given document.
+	Supports child-table fields: 'email_ids' and 'phone_nos' (they'll be attached as lists).
+	"""
+
+	child_requests = set()
+	if fields:
+		child_requests = {f for f in fields if f in ("email_ids", "phone_nos")}
+
+	# Keep only real Contact columns for SQL SELECT
+	contact_fields = [f for f in (fields or []) if f not in ("email_ids", "phone_nos")]
+
+	# Always need name to attach children
+	if "name" not in contact_fields:
+		contact_fields = ["name"] + contact_fields
+
+	# If user didn't pass any fields, at least return the name
+	if not fields:
+		contact_fields = ["name"]
+
+	contacts = frappe.get_all(
+		"Contact",
+		fields=contact_fields,
+		filters=[
+			["Dynamic Link", "link_doctype", "=", doctype],
+			["Dynamic Link", "link_name", "=", docname],
+		],
+	)
+
+	if not contacts or not child_requests:
+		# If they didn't ask for children, we're done
+		return contacts
+
+	names = [c["name"] for c in contacts]
+
+	# Discover actual child doctypes from Contact meta
+	cmeta = frappe.get_meta("Contact")
+	email_child_dt = cmeta.get_field("email_ids").options   # usually "Contact Email"
+	phone_child_dt = cmeta.get_field("phone_nos").options   # usually "Contact Phone"
+
+	# Bulk fetch children
+	if "email_ids" in child_requests:
+		email_fields = ["parent", "idx"] + _existing_fields(email_child_dt, ["email_id", "is_primary"])
+		email_rows = frappe.get_all(
+			email_child_dt,
+			fields=email_fields,
+			filters={
+				"parenttype": "Contact",
+				"parentfield": "email_ids",
+				"parent": ["in", names],
+			},
+			order_by="parent asc, idx asc",
+		)
+		em_by_parent = defaultdict(list)
+		for r in email_rows:
+			em_by_parent[r["parent"]].append(r)
+	else:
+		em_by_parent = {}
+
+	if "phone_nos" in child_requests:
+		phone_fields = ["parent", "idx"] + _existing_fields(
+			phone_child_dt,
+			["phone", "is_primary_phone", "is_primary_mobile_no", "is_primary"]
+		)
+		phone_rows = frappe.get_all(
+			phone_child_dt,
+			fields=phone_fields,
+			filters={
+				"parenttype": "Contact",
+				"parentfield": "phone_nos",
+				"parent": ["in", names],
+			},
+			order_by="parent asc, idx asc",
+		)
+		ph_by_parent = defaultdict(list)
+		for r in phone_rows:
+			ph_by_parent[r["parent"]].append(r)
+	else:
+		ph_by_parent = {}
+
+	# Attach requested children
+	for c in contacts:
+		if "email_ids" in child_requests:
+			c["email_ids"] = em_by_parent.get(c["name"], [])
+		if "phone_nos" in child_requests:
+			c["phone_nos"] = ph_by_parent.get(c["name"], [])
+
+	return contacts

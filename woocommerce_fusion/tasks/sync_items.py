@@ -27,15 +27,43 @@ from woocommerce_fusion.woocommerce.woocommerce_api import (
 )
 # add to your imports
 from woocommerce_fusion.integrations import wp_media
-from woocommerce_fusion.integrations.content_enrichment import generate_website_contenant, classify_item_group, retouch_item_images, classify_item_collections
-from urllib.parse import quote
-import posixpath
+from woocommerce_fusion.integrations.content_enrichment import generate_website_contenant, classify_item_group, retouch_item_images, classify_item_collections, treat_left_item_images
+from woocommerce_fusion.integrations.item_images_treatment import dedupe_item_images
+
+
 import pdb
 from typing import List
+import mimetypes
+import posixpath
+import re
+from urllib.parse import urljoin, urlparse
 
-s = frappe.get_doc("WooCommerce Fusion Settings")
-if s.get("verify_ssl_certificates") is not None:
-    _VERIFY_TLS = bool(s.get("verify_ssl_certificates"))
+import frappe
+from frappe.utils import get_url
+from frappe.utils import flt, cint
+
+def _get_shipping_class_slug(item) -> str:
+    # ERPNext fields (adapt if your fieldnames differ)
+    is_vol = cint(item.custom_is_volumineux) == 1
+
+    # choose the weight field you trust (SEO weight or ERPNext weight)
+    weight = flt(item.custom_seo_weight or 0)
+
+    if is_vol:
+        return "volumineux"
+    if weight >= 20:
+        return "lourd"
+    return ""  # no class
+_VERIFY_TLS = False
+
+def get_verify_tls() -> bool:
+    """Lit le setting uniquement quand Frappe est initialisé (runtime)."""
+    global _VERIFY_TLS
+    if _VERIFY_TLS is None:
+        v = frappe.db.get_single_value("WooCommerce Fusion Settings", "verify_ssl_certificates")
+        # Choisis ton défaut : True est généralement le meilleur
+        _VERIFY_TLS = True if v is None else bool(v)
+    return _VERIFY_TLS
 
 def _extract_meta_key_from_jsonpath(expr: str) -> str | None:
 	"""
@@ -67,154 +95,357 @@ def _upsert_meta(wc_obj, key: str, value) -> bool:
 	# append if not found
 	meta.append({"key": key, "value": value})
 	return True
-def _iter_item_image_urls(item: "Item") -> List[str]:
+
+def _safe_json_list(value, *, default=None):
+    """Return a list from JSON stored in DB (handles 'null', None, '', bad json)."""
+    if default is None:
+        default = []
+
+    if value is None:
+        return list(default)
+
+    # sometimes the field is already a python object
+    if isinstance(value, list):
+        return value
+    if isinstance(value, (dict, int, float, bool)):
+        return list(default)
+
+    s = str(value).strip()
+    if not s or s.lower() in ("null", "none"):
+        return list(default)
+
+    try:
+        parsed = json.loads(s)
+    except Exception:
+        frappe.log_error("Invalid JSON in woocommerce_product.attributes", f"value={s}")
+        return list(default)
+
+    return parsed if isinstance(parsed, list) else list(default)
+
+
+
+
+
+def _upload_item_images_to_wp_and_attach(wc_api, item, wc_product: dict) -> list[dict]:
     """
-    Return all image URLs for an Item:
-      - the main image (item.image field)
-      - all File attachments linked to this Item
+    Rules:
+    - Use ERPNext File attachments as the source of truth.
+    - Upload ONLY File rows where custom_treated_ai == 1.
+    - For each uploaded media, set WP title=custom_wp_title and alt=custom_wp_alternative.
+    - After upload, write media id back to File.custom_wp_id.
+    - For images currently attached to WC product:
+        - if their media id is NOT present in any File.custom_wp_id for this item -> delete them from WP media.
+      IMPORTANT (variation):
+        - also consider WPC additional images stored in meta_data[wpcvi_images]
+    - Then attach the selected/ordered images to the WC product/variation.
     """
-      # Debugging hook (step-by-step)
-    urls = []
 
-    # # 1. Main image (if exists)
-    # if item.image:
-    #     urls.append(wp_media._make_absolute_public_file_url(item.image.strip()))
-
-    # 2. Attached files (File doctype linked to this Item)
-    file_docs = frappe.get_all(
-        "File",
-        filters={"attached_to_doctype": "Item", "attached_to_name": item.name},
-        fields=["file_url"],
-    )
-    for f in file_docs:
-        if f.file_url:
-            urls.append(wp_media._make_absolute_public_file_url(f.file_url.strip()))
-
-    # Remove duplicates while preserving order
-    return list(dict.fromkeys(urls))
-
-
-def _upload_item_images_to_wp_and_attach(wc_api, item: Item, wc_product: dict) -> list[dict]:
-    """
-    Upload all item images (main + gallery) to WP Media, then attach to WC product.
-    - First image becomes the featured product image
-    - Remaining images go into the product gallery
-    Returns the list of media JSONs created.
-    Non-fatal: logs and continues on individual failures.
-    """
-    # image retouch
     MAX_IMAGES_RETOUCH = 10
     MAKE_PUBLIC = 1
     SET_WEBSITE_IMAGE = 1
-    WRITE_ALT_TO_FIELD = ""         # e.g., "custom_image_alt" if you have one
+    WRITE_ALT_TO_FIELD = ""
     ALT_LOCALE = "fr"
-    images_res = retouch_item_images(
-        item_name=item.item_code,
-        max_images=MAX_IMAGES_RETOUCH,
-        make_public=MAKE_PUBLIC,
-        set_website_image=SET_WEBSITE_IMAGE,
-        write_alt_to_field=WRITE_ALT_TO_FIELD,
-        alt_locale=ALT_LOCALE,
-    )
+
+    DRY_RUN = False
+
+    dedupe_item_images(item_name=item.item_code, dry_run=DRY_RUN, detach_missing=True)
     item.reload()
 
-    # Get first keyword for alt text
-    keywords = ""
-    if hasattr(item, "custom_seo_keywords") and item.custom_seo_keywords:
-        keywords = item.custom_seo_keywords.strip()
+    treat_left_item_images(item_name=item.item_code)
+    item.reload()
 
-    first_keyword = ""
-    if keywords:
-        # Split by comma and get the first keyword, removing extra whitespace
-        first_keyword = keywords.split(",")[0].strip()
+    # -------- Helpers --------
+    def _is_image_url(url: str, filename: str | None = None) -> bool:
+        if not url and not filename:
+            return False
+        cand = (filename or url or "").lower()
+        mt, _ = mimetypes.guess_type(cand)
+        if mt and mt.startswith("image/"):
+            return True
+        return cand.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"))
 
-    media_list: list[dict] = []
-    images_payload: list[dict] = []
-    # pdb.set_trace()  # uncomment for debugging
+    def _abs_erpnext_url(file_url: str) -> str:
+        u = (file_url or "").strip()
+        if not u:
+            return u
+        if u.lower().startswith(("http://", "https://")):
+            return u
+        base = get_url().rstrip("/") + "/"
+        return urljoin(base, u.lstrip("/"))
 
-    # Get current WooCommerce product to check existing images
-    wc_product_id = getattr(wc_product, "woocommerce_id", None)
-    if wc_product_id is None and isinstance(wc_product, dict):
-        wc_product_id = wc_product.get("woocommerce_id") or wc_product.get("id")
+    def _fallback_alt() -> str:
+        txt = (
+            (getattr(item, "item_name", "") or getattr(item, "item_code", "") or getattr(item, "name", "") or "")
+            .strip()
+        )
+        txt = re.sub(r"\s+", " ", txt)
+        return (txt[:120] if txt else "Image produit")
 
+    def _wp_update_media(media_id: int, title: str | None, alt_text: str | None) -> None:
+        payload = {}
+        if title:
+            payload["title"] = title
+        if alt_text:
+            payload["alt_text"] = alt_text
+        if not payload:
+            return
+        try:
+            if hasattr(wp_media, "update_media"):
+                wp_media.update_media(media_id, payload)  # type: ignore
+                return
+            if hasattr(wp_media, "request"):
+                wp_media.request("POST", f"/wp/v2/media/{media_id}", json=payload)  # type: ignore
+                return
+        except Exception:
+            frappe.log_error("WP Media update (title/alt) failed", frappe.get_traceback())
+
+    def _wp_media_exists(media_id: int) -> bool:
+        try:
+            if hasattr(wp_media, "get_media"):
+                _ = wp_media.get_media(media_id)  # type: ignore
+                return True
+            if hasattr(wp_media, "request"):
+                r = wp_media.request("GET", f"/wp/v2/media/{media_id}")  # type: ignore
+                if isinstance(r, dict):
+                    return True
+                if hasattr(r, "status_code"):
+                    return int(r.status_code) < 400
+                return True
+        except Exception:
+            tb = frappe.get_traceback().lower()
+            if "404" in tb or "not found" in tb:
+                return False
+            return True
+        return True
+
+    # ✅ ADJUST 1: flag variation early (used later for payload + deletion logic)
+    is_variation = bool(getattr(item, "variant_of", None))
+
+    # -------- Determine WC product id + link_site --------
+    wc_product_id = wc_product.get("woocommerce_id") or wc_product.get("id")
     if not wc_product_id:
         frappe.log_error("WC product ID missing for image sync", f"wc_product={wc_product}")
-        return media_list
+        return []
 
     link_site = f"products/{wc_product_id}"
-    if item.variant_of:
+
+    # Variations support (kept)
+    if is_variation:
         woo_parent_id = frappe.db.get_value(
             "Item WooCommerce Server",
             {
                 "parent": item.variant_of,
                 "parenttype": "Item",
                 "parentfield": "woocommerce_servers",
-                "woocommerce_server": (wc_product.get("woocommerce_server") if isinstance(wc_product, dict) else getattr(wc_product, "woocommerce_server", None)),
-                "enabled": 1
+                "woocommerce_server": wc_product.get("woocommerce_server"),
+                "enabled": 1,
             },
-            "woocommerce_id"
+            "woocommerce_id",
         )
         if woo_parent_id:
             link_site = f"products/{woo_parent_id}/variations/{wc_product_id}"
 
+    # -------- Fetch WC product current images --------
     try:
         wc_product_json = wc_api.get(link_site).json()
     except Exception:
         frappe.log_error("Failed to fetch WC product", frappe.get_traceback())
         wc_product_json = {}
 
-    # Map existing image_id -> sha1(src) to detect duplicates
-    existing_image_ids: dict[int, str] = {}
-    if wc_product_json.get("images"):
-        for img in wc_product_json["images"]:
-            if img.get("id"):
-                existing_image_ids[int(img["id"])] = _sha1_of_remote(img.get("src"))
+    wc_attached_media_ids: set[int] = set()
+    for img in (wc_product_json.get("images") or []):
+        if img.get("id"):
+            try:
+                wc_attached_media_ids.add(int(img["id"]))
+            except Exception:
+                pass
 
-    # Iterate ERPNext item images and build images payload
-    for pos, url in enumerate(_iter_item_image_urls(item)):
-        try:
-            filename = posixpath.basename(url) or "erpnext-file"
-            matching_key = _sha1_of_remote(url)
+    # ✅ ADJUST 2: for variations, include WPC additional IDs (meta_data[wpcvi_images])
+    if is_variation:
+        for m in (wc_product_json.get("meta_data") or []):
+            if m.get("key") == "wpcvi_images" and m.get("value"):
+                try:
+                    extra = [int(x.strip()) for x in str(m["value"]).split(",") if x.strip().isdigit()]
+                    wc_attached_media_ids.update(extra)
+                except Exception:
+                    pass
 
-            # Check if an identical image already exists on WC
-            existing_image_id = next((k for k, v in existing_image_ids.items() if v == matching_key), None)
+    # -------- Load ERPNext Files attached to this Item (source of truth) --------
+    def _norm_url(u: str) -> str:
+        u = (u or "").strip()
+        if not u:
+            return ""
+        p = urlparse(u)
+        return (p.path or "").strip() if p.scheme else u
 
-            if existing_image_id:
-                frappe.logger().info(f"Reusing existing image with ID {existing_image_id} for URL {url}")
-                images_payload.append({"id": existing_image_id, "position": pos})
-                # Mark as used
-                del existing_image_ids[existing_image_id]
-            else:
-                # Upload new image to WP Media
-                m = wp_media.upload_media_from_url(url, filename=filename, alt_text=first_keyword)
-                media_list.append(m)
-                images_payload.append({"id": int(m["id"]), "position": pos})
-                frappe.logger().info(f"Uploaded new image with ID {m['id']} for URL {url}")
-        except Exception as e:
-            error_msg = f"Image upload failed for {url}: {e}"
-            print(error_msg)
-            frappe.log_error("WP Media upload failed", f"{error_msg}\n\n{frappe.get_traceback()}")
+    def _get_files(attached_to_name: str):
+        it = frappe.get_doc("Item", attached_to_name)
+
+        rows = frappe.get_all(
+            "File",
+            filters={
+                "attached_to_doctype": "Item",
+                "attached_to_name": attached_to_name,
+                "is_folder": 0,
+            },
+            fields=[
+                "name",
+                "file_url",
+                "file_name",
+                "custom_treated_ai",
+                "custom_wp_id",
+                "custom_wp_title",
+                "custom_wp_alternative",
+                "creation",
+                "attached_to_field",
+            ],
+            order_by="creation asc",
+        )
+
+        if not rows:
+            return rows
+
+        item_image = _norm_url(getattr(it, "image", "") or "")
+        if not item_image:
+            return rows
+
+        # 1) Prefer file explicitly attached to field "image"
+        for i, r in enumerate(rows):
+            if r.get("attached_to_field") == "image":
+                if i == 0:
+                    return rows
+                return [rows[i]] + rows[:i] + rows[i + 1 :]
+
+        # 2) Else match by URL equality
+        idx = None
+        for i, r in enumerate(rows):
+            if _norm_url(r.get("file_url")) == item_image:
+                idx = i
+                break
+
+        if idx is None or idx == 0:
+            return rows
+
+        # Move only that one to the front, preserve the rest order
+        return [rows[idx]] + rows[:idx] + rows[idx + 1 :]
+
+    file_rows = _get_files(item.name)
+    if not file_rows and getattr(item, "item_code", None) and item.item_code != item.name:
+        file_rows = _get_files(item.item_code)
+
+    treated_files = []
+    for f in file_rows:
+        url = (f.get("file_url") or "").strip()
+        if not url:
             continue
+        if int(f.get("custom_treated_ai") or 0) != 1:
+            continue
+        if not _is_image_url(url, f.get("file_name")):
+            continue
+        treated_files.append(f)
 
-    # Delete unused images left on the product (those not reused above)
-    if existing_image_ids:
+    # ERPNext set of "valid WP media ids" for this item
+    erp_wp_ids: set[int] = set()
+    for f in treated_files:
+        if f.get("custom_wp_id"):
+            try:
+                erp_wp_ids.add(int(f["custom_wp_id"]))
+            except Exception:
+                pass
+
+    # Delete WC-attached images that are NOT referenced by ERPNext Files
+    unused_on_wc = sorted(list(wc_attached_media_ids - erp_wp_ids))
+    if unused_on_wc:
         try:
-            wp_media.delete_media_by_ids(list(existing_image_ids.keys()))
-            frappe.logger().info(f"Deleted {len(existing_image_ids)} unused WordPress media files")
+            wp_media.delete_media_by_ids(unused_on_wc)
+            frappe.logger().info(
+                f"Deleted {len(unused_on_wc)} WP media not referenced by ERPNext (custom_wp_id)"
+            )
         except Exception:
             frappe.log_error("WP Media delete failed", frappe.get_traceback())
 
-    # Update WooCommerce product with images
+    # -------- Upload / reuse media in order --------
+    media_list: list[dict] = []
+    images_payload: list[dict] = []
+
+    for pos, f in enumerate(treated_files):
+        url_rel = (f.get("file_url") or "").strip()
+        url_abs = _abs_erpnext_url(url_rel)
+
+        filename = f.get("file_name") or (posixpath.basename(url_rel) or "erpnext-file")
+
+        wp_title = (f.get("custom_wp_title") or "").strip() or None
+        wp_alt = (f.get("custom_wp_alternative") or "").strip() or _fallback_alt()
+
+        try:
+            media_id = None
+
+            if f.get("custom_wp_id"):
+                try:
+                    candidate = int(f["custom_wp_id"])
+                    if _wp_media_exists(candidate):
+                        media_id = candidate
+                    else:
+                        frappe.db.set_value("File", f["name"], "custom_wp_id", None)
+                        media_id = None
+                except Exception:
+                    media_id = None
+
+            if media_id is None:
+                m = wp_media.upload_media_from_url(
+                    url_abs,
+                    filename=filename,
+                    alt_text=wp_alt,
+                )
+                media_list.append(m)
+                media_id = int(m["id"])
+                frappe.db.set_value("File", f["name"], "custom_wp_id", media_id)
+                frappe.logger().info(f"Uploaded new image {media_id} for {url_abs}")
+
+            _wp_update_media(int(media_id), wp_title, wp_alt)
+            images_payload.append({"id": int(media_id), "position": pos})
+
+        except Exception as e:
+            error_msg = f"Image sync failed for File={f.get('name')} url={url_abs}: {e}"
+            frappe.log_error("WP Media upload/attach failed", f"{error_msg}\n\n{frappe.get_traceback()}")
+            continue
+
+    # ✅ ADJUST 3: compute featured + additional ids for variation WPC
+    featured_id = None
+    additional_ids: list[int] = []
+    if images_payload:
+        featured_id = int(images_payload[0]["id"])
+        additional_ids = [int(x["id"]) for x in images_payload[1:]]
+
+    # -------- Update WooCommerce product / variation images --------
     if images_payload:
         try:
-            update_payload = {"images": images_payload}
-            response = wc_api.put(link_site, update_payload)
-            result = response.json() if hasattr(response, "json") else response
-            frappe.logger().info(f"✅ Updated WC product {wc_product_id} with {len(images_payload)} images")
+            if is_variation:
+                payload = {
+                    "image": {"id": int(featured_id)} if featured_id else None,
+                    "meta_data": [{"key": "wpcvi_images", "value": ",".join(str(i) for i in additional_ids)}],
+                }
+                payload = {k: v for k, v in payload.items() if v is not None}
+
+                response = wc_api.put(link_site, payload)
+                _ = response.json() if hasattr(response, "json") else response
+
+                frappe.logger().info(
+                    f"✅ Updated WC variation {wc_product_id}: featured={featured_id}, "
+                    f"wpcvi_images={','.join(map(str, additional_ids))}"
+                )
+            else:
+                response = wc_api.put(link_site, {"images": images_payload})
+                _ = response.json() if hasattr(response, "json") else response
+                frappe.logger().info(f"✅ Updated WC product {wc_product_id} with {len(images_payload)} images")
+
         except Exception:
-            frappe.log_error("WC API product image update failed", frappe.get_traceback())
+            frappe.log_error("WC API product/variation image update failed", frappe.get_traceback())
 
     return media_list
+
+
+
 
 
 def run_item_sync_from_hook(doc, method):
@@ -380,7 +611,7 @@ class SynchroniseItem(SynchroniseWooCommerce):
             consumer_secret=wc_server_doc.api_consumer_secret,
             version="wc/v3",
             timeout=300,
-            verify_ssl=_VERIFY_TLS,
+            verify_ssl=get_verify_tls(),
         )
 	def get_corresponding_item_or_product(self):
 		"""
@@ -448,16 +679,30 @@ class SynchroniseItem(SynchroniseWooCommerce):
 		Syncronise Item between ERPNext and WooCommerce
 		"""
 		if not(self.item.item.variant_of) and frappe.utils.cint(self.item.item.custom_generate_classification) == 1:
+			update=frappe.utils.cint(self.item.item.custom_force_regenerate_item_group)
 			classify_item_group(item_name=self.item.item.item_code,
-								update=1,            # 0 or 1
+								update=update,            # 0 or 1
 								threshold=0.85,      # stricter than default
 								language="fr",
 								skip_root_if="All Item Groups")
 			self.item.item.reload()
 		if not(self.item.item.variant_of) and frappe.utils.cint(self.item.item.custom_generate_tag) == 1:
+
+			
+			if not self.woocommerce_product:
+				rows = frappe.get_all(
+					"Item WooCommerce Server",
+					filters={"parenttype": "Item", "parent": 'AP-P'},
+					fields=["woocommerce_server"],
+					order_by="idx asc",
+					limit=1,
+				)
+				woocommerce_server = rows[0].woocommerce_server
+			else:
+				woocommerce_server = self.woocommerce_product.woocommerce_server
 			classify_item_collections(
 				 item_name=self.item.item.item_code,
-				 wc_server=self.woocommerce_product.woocommerce_server
+				 wc_server=woocommerce_server
 			)
 			self.item.item.reload()
 
@@ -489,20 +734,13 @@ class SynchroniseItem(SynchroniseWooCommerce):
 			# Sync item discount
 			sync_price=sync_single_item_discount(item_code=self.item.item.item_code)
 			# Sync item Brand and Unit of Measure
+			
 			payload = {
 				"brands": [],
-				"attributes": [],
+				"attributes": _safe_json_list(getattr(self.woocommerce_product, "attributes", None)),
 				"categories": [],
-				"tags": []
+				"tags": [],
 			}
-			
-			if self.woocommerce_product.attributes:
-				payload = {
-					"brands": [],
-					"attributes": json.loads(self.woocommerce_product.attributes),
-					"categories": [],
-					"tags": []
-				}
 
 
 			if self.item.item.brand:
@@ -537,9 +775,12 @@ class SynchroniseItem(SynchroniseWooCommerce):
 				tags=json.loads(self.item.item.custom_woocomerce_collection)
 				for tag in tags:
 					payload["tags"].append({"id": frappe.utils.cint(tag)})
+			shipping_slug = _get_shipping_class_slug(self.item.item)
 
+				
+			payload["shipping_class"] = shipping_slug
 			if sync_price['message']!="No Discounts":
-				Promo_id=23
+				Promo_id=40
 				if not(self.item.item.variant_of):
 					payload["tags"].append({"id": Promo_id})
 				else:
@@ -620,16 +861,16 @@ class SynchroniseItem(SynchroniseWooCommerce):
 		Update the WooCommerce Product with fields from it's corresponding ERPNext Item
 		"""
 		wc_product_dirty = False
-
+		
 		# Update properties
 		if wc_product.woocommerce_name != item.item.item_name:
 			wc_product.woocommerce_name = item.item.item_name
 			wc_product_dirty = True
-
+		
 		product_fields_changed, wc_product = self.set_product_fields(wc_product, item)
 		if product_fields_changed:
 			wc_product_dirty = True
-
+		
 		if wc_product_dirty:
 			if wc_product.type=="variable" or wc_product.type=="variation":
 				wc_product.flags.ignore_mandatory = True
@@ -650,7 +891,7 @@ class SynchroniseItem(SynchroniseWooCommerce):
 			and item.item_woocommerce_server.enabled
 			and not item.item_woocommerce_server.woocommerce_id
 		):
-
+			
 			# Create a new WooCommerce Product doc
 			wc_product = frappe.get_doc({"doctype": "WooCommerce Product"})
 

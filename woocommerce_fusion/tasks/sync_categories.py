@@ -12,15 +12,21 @@ from woocommerce_fusion.integrations.content_enrichment import generate_item_gro
 import pdb
 import requests  # add this
 
-s = frappe.get_doc("WooCommerce Fusion Settings")
-if s.get("verify_ssl_certificates") is not None:
-    _VERIFY_TLS = bool(s.get("verify_ssl_certificates"))
+_VERIFY_TLS = False
 
+def get_verify_tls() -> bool:
+    """Lit le setting uniquement quand Frappe est initialisé (runtime)."""
+    global _VERIFY_TLS
+    if _VERIFY_TLS is None:
+        v = frappe.db.get_single_value("WooCommerce Fusion Settings", "verify_ssl_certificates")
+        # Choisis ton défaut : True est généralement le meilleur
+        _VERIFY_TLS = True if v is None else bool(v)
+    return _VERIFY_TLS
 def _sha1_of_remote(url: str, chunk: int = 65536) -> str | None:
     """Stream remote file and return SHA1 hex; None on failure."""
     try:
         h = hashlib.sha1()
-        with requests.get(url, stream=True, timeout=60, verify=_VERIFY_TLS) as r:
+        with requests.get(url, stream=True, timeout=60, verify=get_verify_tls()) as r:
             r.raise_for_status()
             for part in r.iter_content(chunk_size=chunk):
                 if part:
@@ -192,7 +198,7 @@ def sync_item_groups_to_wc(wc_server: str):
         consumer_secret=wc_server_doc.api_consumer_secret,
         version="wc/v3",
         timeout=40,
-        verify_ssl=_VERIFY_TLS,
+        verify_ssl=get_verify_tls(),
     )
 
     results = []
@@ -218,7 +224,7 @@ def sync_single_item_group(wc_server: str, item_group_name: str):
         consumer_secret=wc_server_doc.api_consumer_secret,
         version="wc/v3",
         timeout=40,
-        verify_ssl=_VERIFY_TLS,
+        verify_ssl=get_verify_tls(),
     )
 
     item_group = frappe.get_doc("Item Group", item_group_name)

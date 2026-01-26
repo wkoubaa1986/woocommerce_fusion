@@ -16,9 +16,16 @@ from woocommerce_fusion.woocommerce.woocommerce_api import (
 )
 
 
-s = frappe.get_doc("WooCommerce Fusion Settings")
-if s.get("verify_ssl_certificates") is not None:
-    _VERIFY_TLS = bool(s.get("verify_ssl_certificates"))
+_VERIFY_TLS = False
+
+def get_verify_tls() -> bool:
+    """Lit le setting uniquement quand Frappe est initialisé (runtime)."""
+    global _VERIFY_TLS
+    if _VERIFY_TLS is None:
+        v = frappe.db.get_single_value("WooCommerce Fusion Settings", "verify_ssl_certificates")
+        # Choisis ton défaut : True est généralement le meilleur
+        _VERIFY_TLS = True if v is None else bool(v)
+    return _VERIFY_TLS
 
 def update_item_discount_for_woocommerce_from_hook(doc, method):
     """Hook to sync item discounts when pricing rules are created/updated"""
@@ -87,7 +94,7 @@ def get_item_codes_from_rule(rule_data: Dict[str, Any]) -> List[str]:
     # Return unique item codes (in case of duplicates)
     return list(set(item_codes))
 
-def get_active_pricing_rule_names(item_code: str) -> list[str]:
+def get_active_pricing_rule_names(item_code: str, price_list: str) -> list[str]:
     # Build item-group ancestry
     item_group = frappe.db.get_value("Item", item_code, "item_group")
     if not item_group:
@@ -112,6 +119,7 @@ def get_active_pricing_rule_names(item_code: str) -> list[str]:
             AND IFNULL(pr.min_qty, 0) > 0
             AND (pr.valid_from IS NULL OR pr.valid_from <= %(today)s)
             AND (pr.valid_upto IS NULL OR pr.valid_upto >= %(today)s)
+            AND (pr.for_price_list >= %(price_list)s)
             AND (
                 EXISTS (
                     SELECT 1
@@ -129,7 +137,7 @@ def get_active_pricing_rule_names(item_code: str) -> list[str]:
                 )
             )
         """,
-        {"today": today, "item_code": item_code, "has_groups": has_groups, "groups": groups_tuple},
+        {"today": today, "item_code": item_code,"price_list": price_list, "has_groups": has_groups, "groups": groups_tuple},
         as_dict=True,
     )
 
@@ -185,6 +193,7 @@ class SynchroniseItemDiscount(SynchroniseWooCommerce):
         self.pricing_rules = []
         self.discount_per_items_QTY = {}
 
+
     def run(self) -> None:
         """Run discount synchronisation"""
         for server in self.servers:
@@ -201,7 +210,7 @@ class SynchroniseItemDiscount(SynchroniseWooCommerce):
             consumer_secret=self.wc_server.api_consumer_secret,
             version="wc/v3",
             timeout=300,
-            verify_ssl=_VERIFY_TLS,
+            verify_ssl=get_verify_tls(),
         )
     def _is_sync_enabled(self) -> bool:
         """Check if discount sync is enabled for this server"""
@@ -326,10 +335,12 @@ class SynchroniseItemDiscount(SynchroniseWooCommerce):
         response = frappe.db.sql(query, values, as_dict=True)
         
         self.pricing_rules = response
+        
 
 
     def sync_discounts_with_woocommerce(self) -> None:
         """Synchronise discounts with WooCommerce"""
+        
         if not self.pricing_rules:
             wc_api = self.get_wc_api()
 
@@ -378,7 +389,7 @@ class SynchroniseItemDiscount(SynchroniseWooCommerce):
                 })
 
             return results
-
+        
         for rule_data in self.pricing_rules:
             try:
                 pricing_rule = frappe.get_doc("Pricing Rule", rule_data['name'])
@@ -450,7 +461,6 @@ class SynchroniseItemDiscount(SynchroniseWooCommerce):
     def _sync_quantity_discount(self, rule_data):
         payloads = self._build_discount_data(rule_data, "quantity")
         wc_api = self.get_wc_api()
-
         CLEAR_TIERS = {
             "tiered_pricing_type": "fixed",
             "tiered_pricing_fixed_rules": {},
@@ -554,7 +564,9 @@ class SynchroniseItemDiscount(SynchroniseWooCommerce):
                 })
                 continue
             if type == "quantity":
-                all_related_pricing_rules = get_active_pricing_rule_names(item)
+                
+                all_related_pricing_rules = get_active_pricing_rule_names(item,self.wc_server.price_list)
+                
                 fixed_map: dict[int, float] = {}
                 for name in all_related_pricing_rules:
                     pr = frappe.get_doc("Pricing Rule", name)
@@ -646,7 +658,7 @@ class SynchroniseItemDiscount(SynchroniseWooCommerce):
                         "status": "ok",
                     })
 
-
+        
         return items_payloads
 
     

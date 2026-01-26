@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 import pdb
 from xml.parsers.expat import model
+import hashlib  # <-- ADD
 # --- third-party ---
 from erpnext.setup.doctype import brand
 import requests
@@ -30,6 +31,8 @@ from frappe.utils.file_manager import save_file
 from google import genai
 from google.genai import types as genai_types
 from woocommerce_fusion.tasks.utils import APIWithRequestLogging
+from woocommerce_fusion.integrations.item_images_treatment import _is_image_url, _detach_file_doc, dedupe_item_images
+
 class ItemGroupClassifier:
     """
     Classify ERPNext Items into existing (leaf) Item Groups using the OpenAI SDK (multimodal).
@@ -97,7 +100,7 @@ class ItemGroupClassifier:
 
     @classmethod
     def _read_openai_key(cls) -> Optional[str]:
-        return cls._read_setting("openai_api_key") or frappe.conf.get("openai_api_key")
+        return cls._read_setting("openai_api_key")
 
     # -------------------- public API --------------------
     def _get_parent_group(self, group_name: str) -> Optional[str]:
@@ -193,6 +196,7 @@ class ItemGroupClassifier:
             "- Use EXACT tag names as provided (case and spelling).\n"
             "- Prefer specific tags. If none fit, return an empty list."
         )
+        description = f"{it.description or ''}"
         if it.custom_web_short_description:
             description = f"{it.description or ''}\n\n{it.custom_web_short_description}"
         user_obj = {
@@ -260,6 +264,7 @@ class ItemGroupClassifier:
                 except Exception:
                     pass
                 setattr(it, write_field, text)
+            it.custom_generate_tag=0
             it.save(ignore_permissions=True)
             frappe.db.commit()
             out["updated"] = True
@@ -368,10 +373,12 @@ class ItemGroupClassifier:
 
         if update and conf >= float(threshold) and it.item_group != chosen_name:
             it.item_group = chosen_name
+            it.custom_force_regenerate_item_group=0
             # Save alternatives to custom_woocommerce_categories
         if it.meta.has_field("custom_woocomerce_categories"):
             # Join alternatives with comma
             it.custom_woocomerce_categories = ", ".join(alts) if alts else ""
+        it.custom_generate_classification=0
         it.save(ignore_permissions=True)
         frappe.db.commit()
         out["updated"] = True
@@ -1351,9 +1358,7 @@ def enrich_item_content_with_openai_search(
             "seo_title": "<= 60 chars",
             "slug": "kebab-case, <= 80 chars",
             "meta_description": "140-160 chars",
-            "short_desc": "plain text, <= 400 chars",
-            "long_html": "HTML with <h2>/<ul>/<p>, <= 1200 words. Facts only.",
-            "product_weight": "string?, e.g. '2.5' always in kg"
+            "long_html": "HTML with <h2>/<ul>/<p>, <= 1200 words. Facts only."
         }
     }
     sys1= (
@@ -1367,8 +1372,6 @@ def enrich_item_content_with_openai_search(
     "- web_context.spec_bullets\n"
     "- focus_keyword : which is the focus keyword\n"
     "- generated_keywords (including the focus keyword)\n\n"
-    "- variants (dict: attribute -> list of values; may be empty)\n"
-    "- variant_intro (short, preformatted one-liner built from `variants`; may be empty)\n"
 
     "🔑 FOCUS KEYWORD:\n"
     f"Use the focus keyword: `{focus_keyword}`. Use it EXACTLY as-is:\n"
@@ -1388,7 +1391,6 @@ def enrich_item_content_with_openai_search(
         f'  "meta_description": "140–160 chars, `{focus_keyword}` once",\n'
         f'  "short_desc": "≤ 400 chars, keyword in first 100 chars",\n'
         '  "long_html": "well-structured semantic HTML content (see below)",\n'
-        '  "product_weight": "estimation of the product string in kg, e.g., \\"0.3\\"",\n'
         "}\n\n"
     )
     
@@ -1400,7 +1402,6 @@ def enrich_item_content_with_openai_search(
             f'  "meta_description": "140–160 chars, {focus_keyword} once",\n'
             f'  "short_desc": "≤ 600 chars, keyword in first 100 chars, If `variants`: {variants} is not empty, APPEND it (~≤160 chars) at the an intro that lists ONLY the configuration attribute NAMES from `variants` (i.e., the DICTIONARY KEYS, not their values). Attributs disponibles — <key1> (<brief-role1>) | <key2> (<brief-role2>) | ,\n'
             '  "long_html": "well-structured semantic HTML content (see below)",\n'
-            '  "product_weight": "estimation of the product string in kg, e.g., \"0.3\"",\n'
             "}\n\n")
     if config_variant :
         parent_it=frappe.get_doc("Item",it.variant_of)
@@ -1495,10 +1496,24 @@ def enrich_item_content_with_openai_search(
     else:
         sys4= ""
     if seo_class == "reverse osmosis system":
-        sys5 = (
-        "   <h2>Étapes de Filtration</h2>"
-        "     • this is a reverse osmosis system, describe each stage (e.g., PP, UDF, CTO, RO, post-carbon, remineralization) using a <ul>\n" 
-        )
+
+
+       sys5 = (
+            "   <h2>Étapes de Filtration</h2>\n"
+            "   <p>Describe each stage below (1–2 sentences), factual and reverse osmosis (RO) oriented. "
+            "Do NOT echo any rules and do NOT add a 'STRICT RULES' section.</p>\n"
+            "   <ul>\n"
+            "     <li><strong>PP</strong>: • describe its role in the filtration chain (sediment/particles prefilter)</li>\n"
+            "     <li><strong>UDF</strong>: • describe its role in the filtration chain (granular carbon, taste/odor/chlorine if applicable)</li>\n"
+            "     <li><strong>CTO</strong>: • describe its role in the filtration chain (carbon block, fine taste/odor/chlorine if applicable)</li>\n"
+            "     <li><strong>RO</strong>: • describe its role in the filtration chain (reverse osmosis membrane, core separation stage)</li>\n"
+            "     <li><strong>post carbon</strong>: • describe its role in the filtration chain (final polishing for taste/odor)</li>\n"
+            "   </ul>\n"
+            "   <p><strong>Optional</strong> (only if the product truly has extra stages such as UV, remineralization, alkalization): "
+            "add a subheading <code>&lt;h3&gt;Optional&lt;/h3&gt;</code> and then a list of optional stages. "
+            "Otherwise, add nothing.</p>\n"
+            "   <p>Return ONLY the final HTML for this section, with no extra commentary.</p>\n"
+        )      
     elif seo_class == "filter cartridge":
         sys5 = (
         "   <h2>Étapes de Filtration</h2>"
@@ -1570,7 +1585,7 @@ def enrich_item_content_with_openai_search(
     # long_html = _strip_sources_and_links(long_html)
     # keywords = [k for k in (data.get("keywords") or []) if isinstance(k, str)][:12]
     # tech_bullets_gen = [b for b in (data.get("tech_bullets") or []) if isinstance(b, str)][:10]
-    product_weight = (data.get("product_weight") or "")
+    # product_weight = (data.get("product_weight") or "")
     short_desc = (data.get("short_desc") or "")[:600]
     if config_variant:
         product_weight = parent_it.custom_seo_weight
@@ -1581,6 +1596,11 @@ def enrich_item_content_with_openai_search(
             slug = parent_it.custom_seo_slug
         if not meta_description:
             meta_description = parent_it.custom_seo_meta_description
+    weight = estimate_weight_and_delivery_class(client, 'gpt-5-mini', images,[it.name,short_desc,it.description])
+ 
+    product_weight = (str(weight.get("weight_kg")) or "")
+    volumineux = (int(weight.get("is_volumineux")) or 0)
+
     # merge bullets + sources
     # bullets_all = list(dict.fromkeys((web.get("bullets") or []) + tech_bullets_gen))[:10]
 
@@ -1600,17 +1620,12 @@ def enrich_item_content_with_openai_search(
         put("custom_web_short_description", short_desc)
         put("custom_web_long_description", long_html)
         put("custom_seo_weight", product_weight)
+        put("custom_is_volumineux", volumineux)
         if it.meta.has_field("custom_seo_keywords"):
             max_len = _field_max_len(it, "custom_seo_keywords") or 140
             kw_text = _join_keywords_to_fit(keywords, max_len)
             put("custom_seo_keywords", kw_text)
-
-        # optionnel: garder un JSON d'audit
-        if it.meta.has_field("custom_enrichment_json"):
-            put("custom_enrichment_json", json.dumps({
-                "identity": identity, "sources": web.get("sources") or [], "keywords": keywords
-            }, ensure_ascii=False))
-
+        it.custom_generate_seo = 0  # reset flag
         it.save(ignore_permissions=True)
         frappe.db.commit()
 
@@ -1634,7 +1649,7 @@ def enrich_item_content_with_openai_search(
 def generate_brand_seo_minimal(
     brand_name: str,
     language: str = "fr",
-    model: str = "gpt-4o-mini",
+    model: str = "",
     ):
     brand = frappe.get_doc("Brand", brand_name)
     
@@ -1657,7 +1672,8 @@ def generate_brand_seo_minimal(
     if not api_key:
         frappe.throw("openai_api_key manquant (AI settings ou site_config).")
     client = OpenAI(api_key=api_key)
-    temperature = 0.2
+    model = (model or _read_openai_model(default="gpt-4o-mini"))
+    temperature = _read_ai_temperature(default=0.2)
     prompt = f"""
     Tu es un expert SEO pour l’e-commerce (traitement de l’eau).
     Contexte: marque = "{brand_label}".
@@ -1719,7 +1735,7 @@ def generate_brand_seo_minimal(
 def generate_item_group_seo_minimal(
     item_group_name: str,
     language: str = "fr",
-    model: str = "gpt-4o-mini",
+    model: str = "",
     ):
     item_group = frappe.get_doc("Item Group", item_group_name)
 
@@ -1741,7 +1757,8 @@ def generate_item_group_seo_minimal(
     if not api_key:
         frappe.throw("openai_api_key manquant (AI settings ou site_config).")
     client = OpenAI(api_key=api_key)
-    temperature = 0.2
+    model = (model or _read_openai_model(default="gpt-4o-mini"))
+    temperature = _read_ai_temperature(default=0.2)
     prompt = f"""
         Tu es un expert SEO e-commerce (traitement de l’eau).
         Contexte : catégorie (Item Group) = "{group_label}".
@@ -1799,18 +1816,72 @@ def generate_item_group_seo_minimal(
 
 
 # ---------------------------------------------------------------------------
-# Settings helpers
+# Settings helpers (TU LES AS DEJA -> je les réutilise tels quels)
 # ---------------------------------------------------------------------------
 
+def _ai_settings_doctype() -> Optional[str]:
+    # Reuse the same case-insensitive lookup already implemented for OpenAI.
+    return ItemGroupClassifier._ai_single_name()
 
+
+def _read_ai_setting(fieldname: str) -> Optional[str]:
+    return ItemGroupClassifier._read_setting(fieldname)
+
+
+def _read_ai_temperature(*, default: float = 0.2) -> float:
+    try:
+        return float(
+            _read_ai_setting("open_ai_temperature")
+            or _read_ai_setting("openai_temperature")
+            or default
+        )
+    except Exception:
+        return default
+
+
+def _read_openai_model(*, default: str = "gpt-4o-mini") -> str:
+    return (
+        (_read_ai_setting("open_ai_model") or "").strip()
+        or (_read_ai_setting("openai_model") or "").strip()
+        or default
+    )
+
+
+def _read_gemini_model(*, purpose: str = "image") -> str:
+    """Read Gemini model from AI settings.
+
+    If the configured model looks image-only and we're generating ALT text,
+    fall back to a broadly compatible text-capable model.
+    """
+    configured = (_read_ai_setting("gemini_model") or "").strip()
+    if configured:
+        if purpose == "alt" and "image" in configured.lower():
+            return "gemini-1.5-flash"
+        return configured
+    return "gemini-2.5-flash-image-preview" if purpose == "image" else "gemini-1.5-flash"
 
 
 def _get_gemini_client() -> genai.Client:
-    doc = frappe.get_single("AI settings")
-    api_key = doc.get("gemini_api_key")
+    dt = _ai_settings_doctype() or "AI settings"
+    doc = frappe.get_cached_doc(dt) if _ai_settings_doctype() else frappe.get_single(dt)
+    api_key = (getattr(doc, "gemini_api_key", None) or getattr(doc, "google_api_key", None) or "").strip()
     if not api_key:
-        frappe.throw("google_api_key missing in 'AI settings' or site_config.")
+        frappe.throw("Gemini API key missing in Single DocType 'AI settings' (gemini_api_key).")
     return genai.Client(api_key=api_key)
+
+
+def _get_openai_client() -> OpenAI:
+    api_key = (
+        (ItemGroupClassifier._read_openai_key() or "").strip()
+        or (frappe.conf.get("openai_api_key") or "").strip()
+    )
+    if not api_key:
+        frappe.throw("OpenAI API key missing (AI settings openai_api_key or site_config openai_api_key).")
+    return OpenAI(api_key=api_key)
+
+
+def _is_gpt5(model_name: str) -> bool:
+    return str(model_name or "").lower().startswith("gpt-5")
 
 
 # ---------------------------------------------------------------------------
@@ -1818,6 +1889,7 @@ def _get_gemini_client() -> genai.Client:
 # ---------------------------------------------------------------------------
 
 def _file_url_to_path(file_url: str) -> Optional[str]:
+    """Map ERPNext File.file_url -> disk path for local storage."""
     s = (file_url or "").strip("/")
     parts = s.split("/")
     if len(parts) >= 2 and parts[0] == "private" and parts[1] == "files":
@@ -1827,25 +1899,69 @@ def _file_url_to_path(file_url: str) -> Optional[str]:
     return None
 
 
-def _bytes_from_file_record(frow: Dict[str, Any]) -> bytes:
-    url = (frow.get("file_url") or "").strip()
+def _is_probably_image_file(file_name: str, file_url: str) -> bool:
+    name = (file_name or "").lower()
+    url = (file_url or "").lower()
+    guess = mimetypes.guess_type(name or url)[0] or ""
+    if guess.startswith("image/"):
+        return True
+    return any((name.endswith(ext) or url.endswith(ext)) for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"))
+
+
+def _safe_read_file_bytes(file_url: str) -> Optional[bytes]:
+    """Read bytes from disk if possible, else from HTTP(S). Returns None on failure."""
+    url = (file_url or "").strip()
     if not url:
-        raise ValueError("Fichier sans file_url")
-    p = _file_url_to_path(url)
-    if p and Path(p).exists():
-        return Path(p).read_bytes()
-    abs_url = url
-    if not abs_url.lower().startswith(("http://", "https://")):
-        abs_url = urljoin(get_url(), url)
-    r = requests.get(abs_url, timeout=30)
-    r.raise_for_status()
-    return r.content
+        return None
+
+    # disk
+    try:
+        p = _file_url_to_path(url)
+        if p and Path(p).exists():
+            return Path(p).read_bytes()
+    except Exception:
+        pass
+
+    # http(s)
+    try:
+        abs_url = url if url.lower().startswith(("http://", "https://")) else urljoin(get_url(), url)
+        r = requests.get(abs_url, timeout=30)
+        r.raise_for_status()
+        return r.content
+    except Exception:
+        return None
 
 
-def _pil_to_webp_bytes(im: Image.Image, *, size=(2000, 2000), quality=88) -> bytes:
-    """
-    Fit image into size, pad to square on white, return WEBP bytes.
-    """
+def _sha256_hex(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+def _set_if_field_exists(doc, fieldname: str, value) -> None:
+    try:
+        if fieldname and doc.meta.has_field(fieldname):
+            setattr(doc, fieldname, value)
+    except Exception:
+        pass
+
+
+def _has_db_column(doctype: str, column: str) -> bool:
+    try:
+        return bool(frappe.db.has_column(doctype, column))
+    except Exception:
+        return False
+
+
+def _is_treated_ai_file(file_doc) -> bool:
+    try:
+        if file_doc.meta.has_field("custom_treated_ai"):
+            return int(getattr(file_doc, "custom_treated_ai") or 0) == 1
+    except Exception:
+        pass
+    return False
+
+
+def _pil_to_webp_square_bytes(im: Image.Image, *, size=(2000, 2000), quality=88) -> bytes:
+    """Force final to a square white canvas and export WEBP."""
     im = im.convert("RGB")
     target_w, target_h = size
     scale = min(target_w / im.width, target_h / im.height)
@@ -1862,104 +1978,189 @@ def _pil_to_webp_bytes(im: Image.Image, *, size=(2000, 2000), quality=88) -> byt
     return out.getvalue()
 
 
+def _reencode_bytes_to_match_original(*, edited_bytes: bytes, original_file_name: str = "", original_file_url: str = "") -> bytes:
+    """If we overwrite in-place, keep extension semantics (.jpg stays jpg, etc.)."""
+    ext = (Path(original_file_name or original_file_url).suffix or "").lower().strip()
+    if ext in {".webp", ".jpg", ".jpeg", ".png"}:
+        try:
+            im = Image.open(io.BytesIO(edited_bytes)).convert("RGB")
+            out = io.BytesIO()
+            if ext in {".jpg", ".jpeg"}:
+                im.save(out, format="JPEG", quality=88, optimize=True)
+                return out.getvalue()
+            if ext == ".png":
+                im.save(out, format="PNG", optimize=True)
+                return out.getvalue()
+            im.save(out, format="WEBP", quality=88, method=6)
+            return out.getvalue()
+        except Exception:
+            return edited_bytes
+    return edited_bytes
+
+
 # ---------------------------------------------------------------------------
-# Gemini image edit + alt text
+# ALT + Title generation (ALT garanti non vide)
 # ---------------------------------------------------------------------------
 
-EDIT_PROMPT = (
-    "E-commerce product image edit with STRICT centering and sizing requirements:\n\n"
-    
-    "BACKGROUND & CLEANUP:\n"
-    "- Background: remove completely and replace with pure white (#FFFFFF); absolutely no gradients, textures, or shadows on background.\n"
-    "- Remove overlays: erase any non-product text/graphics such as phone numbers, URLs, emails, QR codes, stickers, badges, watermarks, price tags, or icons. PRESERVE product labels/logos that are part of the product itself.\n\n"
-    
-    "CANVAS & OUTPUT:\n"
-    "- Canvas: exactly 1024×1024 pixels (perfect square).\n"
-    "- Output: high-quality WebP format on pure white background.\n\n"
-    
-    "CRITICAL SIZING & CENTERING (FOLLOW PRECISELY):\n"
-    "1. MEASURE the product's bounding box (width and height) EXCLUDING any shadow you will add.\n"
-    "2. CALCULATE the maximum scale factor: min(950/product_width, 950/product_height) - this ensures the product fits in ~93% of canvas.\n"
-    "3. SCALE the product using this factor - it should occupy 900-950 pixels on its largest dimension.\n"
-    "4. CENTER EXACTLY: place the scaled product at coordinates (512, 512) - the absolute center of the 1024×1024 canvas.\n"
-    "5. VERIFY centering: equal white space on all sides (35-60 pixels margin).\n\n"
-    
-    "SHADOW (AFTER CENTERING):\n"
-    "- Add a subtle, soft drop shadow UNDER the product only (10-15% opacity, natural blur).\n"
-    "- Shadow must stay within canvas bounds and not affect product positioning.\n"
-    "- Shadow should be directly beneath the product, slightly offset downward.\n\n"
-    
-    "QUALITY REQUIREMENTS:\n"
-    "- Preserve product exactly as-is: same colors, textures, shape, proportions, and all genuine product labels.\n"
-    "- Apply light sharpening and denoising.\n"
-    "- Clean cutout edges with no halos or artifacts.\n"
-    "- Neutral, true-to-life colors - avoid oversaturation.\n\n"
-    
-    "PROHIBITIONS:\n"
-    "- NO stretching or aspect ratio distortion.\n"
-    "- NO added text, graphics, borders, watermarks, or props.\n"
-    "- NO reflections or mirror effects.\n"
-    "- NO off-center positioning - must be perfectly centered.\n\n"
-    
-    "VALIDATION CHECKLIST:\n"
-    "✓ Product is scaled large (900-950px on longest side)\n"
-    "✓ Product is perfectly centered at (512, 512)\n"
-    "✓ Equal margins on all sides (35-60px)\n"
-    "✓ Pure white background everywhere\n"
-    "✓ Subtle shadow beneath product only\n"
-    "✓ Clean, professional e-commerce appearance"
-)
-
-
-def _gemini_edit_image_bytes(client: genai.Client, img_bytes: bytes) -> bytes:
-    """
-    Use Gemini to edit the image per EDIT_PROMPT.
-    Returns PNG/WEBP bytes directly from the model if provided,
-    else falls back to local square white canvas.
-    """
+def _derive_wp_title(item_name: str, file_doc) -> str:
     try:
-        # Load the base image for the request
-        base_im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        it = frappe.get_cached_doc("Item", item_name)
+        title = (it.item_name or it.item_code or "").strip()
+        if title:
+            return title[:140]
+    except Exception:
+        pass
+    stem = re.sub(r"\.[a-z0-9]+$", "", (getattr(file_doc, "file_name", "") or ""), flags=re.I).strip()
+    return (stem or "Image produit")[:140]
 
-        # google-genai SDK accepts PIL Image directly in contents
-        resp = client.models.generate_content(
-            model="gemini-2.5-flash-image-preview",
-            contents=[base_im, EDIT_PROMPT],
+
+def _fallback_alt_from_item(item_name: str, max_len: int = 120) -> str:
+    try:
+        it = frappe.get_cached_doc("Item", item_name)
+        txt = (it.item_name or it.item_code or item_name or "").strip()
+    except Exception:
+        txt = (item_name or "").strip()
+    txt = re.sub(r"\s+", " ", txt).strip()
+    return (txt[:max_len] if txt else "Image produit")[:max_len]
+
+
+import io
+import re
+import base64
+from PIL import Image
+
+def _openai_generate_alt_from_bytes(
+    img_bytes: bytes,
+    *,
+    locale: str = "fr",
+    base: str = "",
+    principal_keyword: str = "",
+    description: str = "",
+    max_chars: int = 250,   # ✅ adjustable (SEO-friendly default)
+) -> str:
+    """
+    SEO ALT (Vision):
+    - Uses image as source of truth.
+    - MUST include principal_keyword EXACTLY (verbatim substring).
+    - Can use base + description for wording, but must not add invisible claims.
+    - Returns plain text only (no quotes, no trailing punctuation).
+    """
+    principal_keyword = (principal_keyword or "").strip()
+    base = (base or "").strip()
+    description = (description or "").strip()
+    
+    try:
+        client = _get_openai_client()
+        model_name = "gpt-4o-mini"
+        lang = "fr" if (locale or "").lower().startswith("fr") else "en"
+
+        desc_short = re.sub(r"\s+", " ", description).strip()[:400] if description else ""
+
+        # IMPORTANT: force exact keyword inclusion
+        if principal_keyword:
+            kw_template = (
+            "Output format (follow strictly):\n"
+            f'- Start the ALT with the exact phrase "{principal_keyword}", then continue description.\n'
         )
 
-        # Extract the first inline image from the response
-        for cand in getattr(resp, "candidates", []) or []:
-            parts = getattr(cand, "content", None)
-            if not parts:
-                continue
-            for part in parts.parts:
-                if getattr(part, "inline_data", None) and getattr(part.inline_data, "mime_type", ""):
-                    raw = part.inline_data.data
-                    out = Image.open(io.BytesIO(raw))
-                    # Enforce 2000×2000 WEBP final (even if model already did)
-                    return _pil_to_webp_bytes(out, size=(2000, 2000), quality=88)
+        prompt = (
+            f"Write e-commerce image ALT text in {lang}.\n"
+            f"Length: 60–{int(max_chars)} characters.\n"
+            "Use the image as the source of truth.\n"
+            "Describe what is clearly visible ONLY.\n"
+            "Do not guess technical features not visible.\n"
+            "No SKU. No model codes. No brand unless printed.\n"
+            "Return ONLY the ALT text. No quotes. No trailing punctuation.\n\n"
+            f"{kw_template}\n"
+            "Context (may help naming, but do not invent details):\n"
+            f"- Product base name: {base}\n"
+            f"- Product description (text only): {desc_short}\n"
+        )
 
-        # If nothing extracted, fallback
-        return _pil_to_webp_bytes(base_im)
+        # Build data URL
+        im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=85)
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        data_url = f"data:image/jpeg;base64,{b64}"
+
+        params = {
+            "model": model_name,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url, "detail": "low"}},
+                ],
+            }],
+        }
+
+        # GPT-5* models don't support max_tokens -> use max_completion_tokens
+        if _is_gpt5(model_name):
+            params["max_completion_tokens"] =200
+        else:
+            params["max_tokens"] = 200
+            params["temperature"] = 0.0
+        
+        resp = client.chat.completions.create(**params)
+        txt = (resp.choices[0].message.content or "").strip()
+        txt = re.sub(r"\s+", " ", txt).strip()
+        txt = txt.strip('"\'')
+        
+        # remove trailing punctuation
+        txt = re.sub(r"[.!?。！？]+$", "", txt).strip()
+
+        # ---- HARD ENFORCEMENT: guarantee keyword exact ----
+        if principal_keyword:
+            # ensure keyword appears at least once
+            if principal_keyword not in txt:
+                txt = f"{principal_keyword} {txt}".strip()
+
+            # ensure keyword appears EXACTLY once (avoid stuffing)
+            count = txt.count(principal_keyword)
+            if count > 1:
+                # keep first occurrence, remove extra duplicates
+                parts = txt.split(principal_keyword)
+                txt = principal_keyword + (" ".join(parts[1:]).replace(principal_keyword, "")).strip()
+                txt = re.sub(r"\s+", " ", txt).strip()
+
+        # enforce length while preserving keyword
+        if len(txt) > max_chars:
+            if principal_keyword and principal_keyword in txt:
+                # keep keyword + as much as possible after it
+                start = txt.find(principal_keyword)
+                if start > 0:
+                    # prefer making keyword near the beginning
+                    txt = (principal_keyword + " " + txt.replace(principal_keyword, "", 1).strip()).strip()
+                txt = txt[:max_chars].rstrip()
+            else:
+                txt = txt[:max_chars].rstrip()
+
+        return txt
 
     except Exception:
-        # Safety fallback: just square+pad locally
-        im = Image.open(io.BytesIO(img_bytes))
-        return _pil_to_webp_bytes(im)
+        # last-resort fallback that still includes keyword
+        if principal_keyword:
+            fallback = f"{principal_keyword} {base}".strip()
+            fallback = re.sub(r"\s+", " ", fallback).strip()
+            return fallback[:max_chars]
+        fallback = re.sub(r"\s+", " ", base).strip()
+        return fallback[:max_chars]
+
 
 
 def _gemini_generate_alt(client: genai.Client, image_url: str, locale: str = "fr") -> str:
     lang = "fr" if (locale or "").lower().startswith("fr") else "en"
     prompt = (
         f"Write concise, neutral e-commerce ALT text in {lang} (≤120 chars). "
-        "Describe only what is clearly visible, no SKU/brand unless printed."
+        "Describe only what is clearly visible, no SKU/brand unless printed. "
+        "Return ONLY the ALT text."
     )
     try:
         resp = client.models.generate_content(
-            model="gemini-1.5-flash",
+            model=_read_gemini_model(purpose="alt"),
             contents=[
                 prompt,
-                # URL reference: the SDK can accept string URL parts
                 genai_types.Part.from_uri(image_url, mime_type="image/*"),
             ],
             config=genai_types.GenerateContentConfig(temperature=0),
@@ -1970,219 +2171,614 @@ def _gemini_generate_alt(client: genai.Client, image_url: str, locale: str = "fr
         return ""
 
 
-# ---------------------------------------------------------------------------
-# Core: process Item attachments and save new Files
-# ---------------------------------------------------------------------------
-
-def _generate_content_based_filename(img_bytes: bytes, item_name: str) -> str:
-    """
-    Analyze image content to generate a descriptive, SEO-friendly filename using OpenAI.
-    """
-    try:
-        # Get OpenAI client
-        api_key = ItemGroupClassifier._read_openai_key()
-        if not api_key:
-            raise ValueError("OpenAI API key not found")
-        
-        client = OpenAI(api_key=api_key)
-        
-        # Convert image bytes to base64 data URL
-        image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        img_buffer = io.BytesIO()
-        image.save(img_buffer, format='JPEG', quality=85)
-        img_base64 = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
-        data_url = f"data:image/jpeg;base64,{img_base64}"
-        
-        prompt = (
-            "Analyze this product image and generate a short, descriptive filename (2-4 words max). "
-            "Focus on the main product, its type, color, or key feature. "
-            "Use only lowercase letters, numbers, and hyphens. "
-            "Examples: 'blue-ceramic-mug', 'steel-kitchen-knife', 'red-leather-bag'. "
-            "Return ONLY the filename, no explanation."
-        )
-        # params = {
-        #     "model": "gpt-4o-mini",
-        #     "response_format": {"type": "json_object"},
-        #     "max_tokens": 50,
-        #     "messages": [{"role": "user", "content": prompt}],
-        # }
-        # if not str(model).lower().startswith("gpt-5"):
-        #     params["temperature"] = 0.01
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",  # or "gpt-4-vision-preview"
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": data_url, "detail": "low"}}
-                    ]
-                }
-            ],
-            max_tokens=50,
-            temperature=0
-        )
-        
-        content_desc = response.choices[0].message.content.strip()
-        
-        # Clean and validate the generated description
-        clean_desc = re.sub(r'[^a-z0-9\-\s]', '', content_desc.lower().strip())
-        clean_desc = re.sub(r'\s+', '-', clean_desc)
-        clean_desc = re.sub(r'-+', '-', clean_desc).strip('-')
-        
-        # Fallback if description is too short or invalid
-        if len(clean_desc) < 3:
-            raise ValueError("Generated description too short")
-            
-        return clean_desc[:50]  # Max 50 chars
-        
-    except Exception:
-        # Fallback to item-based naming
-        item = frappe.get_cached_doc("Item", item_name)
-        base_name = item.item_name or item.item_code or "product"
-        return _slugify(base_name)
-
-def _retouch_one_attachment(
-    client: genai.Client,
-    item_name: str,
-    frow: Dict[str, Any],
+def _ensure_wp_meta_for_file(
     *,
-    make_public: bool = True,
+    file_name: str,
+    item_name: str,
+    gemini_client: Optional[genai.Client],
     alt_locale: str = "fr",
 ) -> Dict[str, Any]:
-    # Check if this file is already AI-generated (skip processing)
-    original_filename = frow.get("file_name", "")
-    if "ai-gen" in original_filename.lower():
+    """
+    Ensures:
+      - File.custom_wp_title
+      - File.custom_wp_alternative (ALT) is NEVER empty after this call.
+    """
+    fdoc = frappe.get_doc("File", file_name)
+
+    # Title
+    if fdoc.meta.has_field("custom_wp_title") and not (getattr(fdoc, "custom_wp_title", None) or "").strip():
+        _set_if_field_exists(fdoc, "custom_wp_title", _derive_wp_title(item_name, fdoc))
+
+    # ALT
+    need_alt = fdoc.meta.has_field("custom_wp_alternative") and not (getattr(fdoc, "custom_wp_alternative", None) or "").strip()
+    if need_alt:
+        alt = ""
+
+        # 1) OpenAI from bytes (works for private/local)
+        b = _safe_read_file_bytes(fdoc.file_url or "")
+        
+        if b:
+            alt = _openai_generate_alt_from_bytes(b, locale=alt_locale)
+
+        # 2) Gemini from URL (only if public)
+        if not alt:
+            try:
+                abs_url = (fdoc.file_url or "").strip()
+                if abs_url and not abs_url.lower().startswith(("http://", "https://")):
+                    abs_url = urljoin(get_url(), abs_url)
+
+                if gemini_client and abs_url.lower().startswith(("http://", "https://")) and int(getattr(fdoc, "is_private", 0) or 0) == 0:
+                    alt = _gemini_generate_alt(gemini_client, abs_url, alt_locale)
+            except Exception:
+                alt = ""
+
+        # 3) Hard fallback (never empty)
+        if not alt:
+            alt = _fallback_alt_from_item(item_name)
+
+        _set_if_field_exists(fdoc, "custom_wp_alternative", alt)
+
+    fdoc.save(ignore_permissions=True)
+    return {
+        "updated": True,
+        "custom_wp_title": getattr(fdoc, "custom_wp_title", None),
+        "custom_wp_alternative": getattr(fdoc, "custom_wp_alternative", None),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Gemini image edit
+# ---------------------------------------------------------------------------
+
+EDIT_PROMPT = (
+    "E-commerce product image edit with STRICT centering and sizing requirements:\n\n"
+    "BACKGROUND & CLEANUP:\n"
+    "- Background: remove completely and replace with pure white (#FFFFFF); absolutely no gradients, textures, or shadows on background.\n"
+    "- Remove overlays: erase any non-product text/graphics such as phone numbers, URLs, emails, QR codes, stickers, badges, watermarks, price tags, or icons. PRESERVE product labels/logos that are part of the product itself.\n\n"
+    "CANVAS & OUTPUT:\n"
+    "- Canvas: exactly 1024×1024 pixels (perfect square).\n"
+    "- Output: high-quality WebP format on pure white background.\n\n"
+    "CRITICAL SIZING & CENTERING (FOLLOW PRECISELY):\n"
+    "1. MEASURE the product's bounding box (width and height) EXCLUDING any shadow you will add.\n"
+    "2. CALCULATE the maximum scale factor: min(950/product_width, 950/product_height).\n"
+    "3. SCALE the product so its largest dimension is 900-950 pixels.\n"
+    "4. CENTER EXACTLY at (512, 512).\n"
+    "5. VERIFY equal white space on all sides (35-60 pixels margin).\n\n"
+    "SHADOW (AFTER CENTERING):\n"
+    "- Add a subtle, soft drop shadow UNDER the product only (10-15% opacity, natural blur).\n"
+    "- Shadow must not affect product positioning.\n\n"
+    "QUALITY REQUIREMENTS:\n"
+    "- Preserve product exactly as-is, same colors, textures, proportions.\n"
+    "- Light sharpening and denoising.\n"
+    "- Clean edges, no halos.\n\n"
+    "PROHIBITIONS:\n"
+    "- NO stretching.\n"
+    "- NO added text/graphics/borders/watermarks/props.\n"
+    "- NO off-center positioning.\n"
+)
+
+
+def _gemini_edit_image_bytes(client: genai.Client, img_bytes: bytes) -> bytes:
+    """
+    Ask Gemini to clean/center the product image.
+    Always returns WEBP square bytes (2000×2000).
+    """
+    base_im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+
+    try:
+        resp = client.models.generate_content(
+            model=_read_gemini_model(purpose="image"),
+            contents=[base_im, EDIT_PROMPT],
+        )
+
+        # Try extract inline image
+        for cand in getattr(resp, "candidates", []) or []:
+            content = getattr(cand, "content", None)
+            if not content:
+                continue
+            for part in content.parts:
+                if getattr(part, "inline_data", None) and getattr(part.inline_data, "mime_type", ""):
+                    raw = part.inline_data.data
+                    out_im = Image.open(io.BytesIO(raw))
+                    return _pil_to_webp_square_bytes(out_im, size=(2000, 2000), quality=88)
+
+        # fallback local
+        return _pil_to_webp_square_bytes(base_im, size=(2000, 2000), quality=88)
+    except Exception:
+        return _pil_to_webp_square_bytes(base_im, size=(2000, 2000), quality=88)
+
+
+# ---------------------------------------------------------------------------
+# Dedup + relink + safe delete helpers (éviter 2 images)
+# ---------------------------------------------------------------------------
+
+def _get_item_attach_fields() -> List[str]:
+    """All Item fields of type Attach/Attach Image/Image (dynamic)."""
+    meta = frappe.get_meta("Item")
+    out = []
+    for df in (meta.fields or []):
+        if df.fieldtype in ("Attach", "Attach Image", "Image") and df.fieldname:
+            out.append(df.fieldname)
+
+    # stable dedupe
+    seen, res = set(), []
+    for f in out:
+        if f not in seen:
+            seen.add(f)
+            res.append(f)
+
+    if "image" not in res:
+        res.insert(0, "image")
+    return res
+
+
+def _relink_old_url_for_other_items_only(
+    *,
+    current_item: str,
+    old_url: str,
+    new_url: str,
+    new_file_name: str = "",
+    new_hash: str = "",
+    new_size: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Replace references old_url -> new_url for:
+      - Item attach/image fields (all Items except current_item)
+      - File rows attached to Items except current_item
+    """
+    old_url = (old_url or "").strip()
+    new_url = (new_url or "").strip()
+    if not old_url or not new_url or old_url == new_url:
+        return {"ok": True, "changed_item_fields": {}, "changed_files": 0}
+
+    changed_item_fields = {}
+
+    for fieldname in _get_item_attach_fields():
+        if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", fieldname):
+            continue
+
+        frappe.db.sql(
+            f"""
+            UPDATE `tabItem`
+            SET `{fieldname}` = %s
+            WHERE `{fieldname}` = %s AND name != %s
+            """,
+            (new_url, old_url, current_item),
+        )
+        cnt = int(frappe.db.sql("SELECT ROW_COUNT()")[0][0] or 0)
+        if cnt:
+            changed_item_fields[fieldname] = cnt
+
+    frappe.db.sql(
+        """
+        UPDATE `tabFile`
+        SET file_url = %s
+        WHERE file_url = %s
+          AND attached_to_doctype = 'Item'
+          AND attached_to_name != %s
+        """,
+        (new_url, old_url, current_item),
+    )
+    changed_files = int(frappe.db.sql("SELECT ROW_COUNT()")[0][0] or 0)
+
+    if new_file_name:
+        frappe.db.sql(
+            """
+            UPDATE `tabFile`
+            SET file_name = %s
+            WHERE file_url = %s
+              AND attached_to_doctype = 'Item'
+              AND attached_to_name != %s
+            """,
+            (new_file_name, new_url, current_item),
+        )
+
+    if new_hash and _has_db_column("File", "content_hash"):
+        frappe.db.sql(
+            """
+            UPDATE `tabFile`
+            SET content_hash = %s
+            WHERE file_url = %s
+              AND attached_to_doctype = 'Item'
+              AND attached_to_name != %s
+            """,
+            (new_hash, new_url, current_item),
+        )
+
+    if (new_size is not None) and _has_db_column("File", "file_size"):
+        frappe.db.sql(
+            """
+            UPDATE `tabFile`
+            SET file_size = %s
+            WHERE file_url = %s
+              AND attached_to_doctype = 'Item'
+              AND attached_to_name != %s
+            """,
+            (int(new_size), new_url, current_item),
+        )
+
+    if _has_db_column("File", "custom_treated_ai"):
+        frappe.db.sql(
+            """
+            UPDATE `tabFile`
+            SET custom_treated_ai = 1
+            WHERE file_url = %s
+              AND attached_to_doctype = 'Item'
+              AND attached_to_name != %s
+            """,
+            (new_url, current_item),
+        )
+
+    return {"ok": True, "changed_item_fields": changed_item_fields, "changed_files": changed_files}
+
+
+def _count_item_url_refs(file_url: str) -> int:
+    url = (file_url or "").strip()
+    if not url:
+        return 0
+    total = 0
+    for fn in _get_item_attach_fields():
+        try:
+            total += frappe.db.count("Item", filters={fn: url})
+        except Exception:
+            pass
+    return int(total)
+
+
+def _safe_delete_file_if_unreferenced(file_docname: str) -> Dict[str, Any]:
+    """
+    Delete File doc only if:
+      - no Item fields point to its file_url
+      - no other File rows share the same file_url
+    """
+    try:
+        fdoc = frappe.get_doc("File", file_docname)
+        url = (fdoc.file_url or "").strip()
+        if not url:
+            return {"deleted": False, "reason": "empty url"}
+
+        others = frappe.get_all("File", filters={"file_url": url, "name": ["!=", fdoc.name]}, pluck="name")
+        if others:
+            return {"deleted": False, "reason": "same url used by other File rows", "others": others[:5]}
+
+        if _count_item_url_refs(url) > 0:
+            return {"deleted": False, "reason": "still referenced by Item fields"}
+
+        frappe.delete_doc("File", fdoc.name, ignore_permissions=True)
+        frappe.db.commit()
+        return {"deleted": True, "file": fdoc.name, "url": url}
+    except Exception as e:
+        return {"deleted": False, "reason": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Core: retouch one attachment (0 duplication + ALT assuré)
+# ---------------------------------------------------------------------------
+
+def _retouch_one_attachment(
+    *,
+    gemini_client: genai.Client,
+    item_name: str,
+    file_docname: str,
+    make_public: bool = True,
+    alt_locale: str = "fr",
+    delete_old_if_replaced: bool = True,
+) -> Dict[str, Any]:
+    """
+    Strategy:
+      - If already treated: DO NOT touch bytes; ensure WP title+ALT.
+      - Else:
+          A) If file exists on disk: overwrite in-place (keeps 1 file forever).
+          B) Else: create new File + relink everywhere + safe-delete old if unreferenced.
+    """
+    fdoc = frappe.get_doc("File", file_docname)
+    old_url = (fdoc.file_url or "").strip()
+    old_name = (getattr(fdoc, "file_name", "") or "").strip()
+    
+    if not _is_probably_image_file(old_name, old_url):
+        return {"skipped": True, "reason": "not an image", "file": fdoc.name, "original_file_url": old_url, "processed_file_url": old_url}
+
+    # already treated -> ensure title/alt only
+    if _is_treated_ai_file(fdoc):
+        meta = _ensure_wp_meta_for_file(file_name=fdoc.name, item_name=item_name, gemini_client=gemini_client, alt_locale=alt_locale)
+        frappe.db.commit()
         return {
-            "original_file_url": frow.get("file_url"),
-            "original_file_name": original_filename,
-            "processed_file_url": frow.get("file_url"),
-            "processed_file_name": original_filename,
-            "content_description": "skipped-ai-gen",
-            "alt": "",
-            "is_private": frow.get("is_private", 0),
-            "original_deleted": False,
             "skipped": True,
-            "reason": "Already AI-generated"
+            "reason": "already treated -> ensured title/alt only",
+            "file": fdoc.name,
+            "original_file_url": old_url,
+            "processed_file_url": old_url,
+            "custom_wp_title": meta.get("custom_wp_title"),
+            "alt": meta.get("custom_wp_alternative"),
         }
-    
-    raw = _bytes_from_file_record(frow)
-    
-    # Generate content-based filename BEFORE editing
-    content_filename = _generate_content_based_filename(raw, item_name)
-    
-    # Edit the image
-    edited_webp = _gemini_edit_image_bytes(client, raw)
 
-    # Add timestamp and AI-gen marker to ensure uniqueness and identification
-    # Option 1: Last 5 digits of timestamp
-    timestamp = random.randint(0, 999)
-    out_name = f"{content_filename}-ai-gen-{timestamp:03d}.webp"
+    # read bytes
+    raw = _safe_read_file_bytes(old_url)
+    if not raw:
+        return {"skipped": True, "reason": "cannot read bytes (disk+http failed)", "file": fdoc.name, "original_file_url": old_url, "processed_file_url": old_url}
 
-    # Save as attached File (WEBP)
-    fdoc = save_file(
-        out_name,
+    # edit via gemini
+    edited_webp = _gemini_edit_image_bytes(gemini_client, raw)
+    new_hash = _sha256_hex(edited_webp)
+    new_size = len(edited_webp)
+
+    # A) in-place overwrite if possible
+    fs_path = _file_url_to_path(old_url)
+    if fs_path and Path(fs_path).exists():
+        try:
+            edited_inplace = _reencode_bytes_to_match_original(
+                edited_bytes=edited_webp,
+                original_file_name=old_name,
+                original_file_url=old_url,
+            )
+            Path(fs_path).write_bytes(edited_inplace)
+
+            if fdoc.meta.has_field("custom_treated_ai"):
+                fdoc.custom_treated_ai = 1
+            if _has_db_column("File", "content_hash"):
+                fdoc.content_hash = _sha256_hex(edited_inplace)
+            if _has_db_column("File", "file_size"):
+                fdoc.file_size = len(edited_inplace)
+
+            fdoc.save(ignore_permissions=True)
+            frappe.db.commit()
+
+            meta = _ensure_wp_meta_for_file(file_name=fdoc.name, item_name=item_name, gemini_client=gemini_client, alt_locale=alt_locale)
+            frappe.db.commit()
+
+            return {
+                "skipped": False,
+                "mode": "in_place_overwrite",
+                "file": fdoc.name,
+                "original_file_url": old_url,
+                "processed_file_url": old_url,
+                "content_hash": _sha256_hex(edited_inplace),
+                "file_size": len(edited_inplace),
+                "custom_wp_title": meta.get("custom_wp_title"),
+                "alt": meta.get("custom_wp_alternative"),
+            }
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "in-place overwrite failed -> fallback to new file")
+
+    # B) fallback: new file + relink + safe delete
+    try:
+        it = frappe.get_cached_doc("Item", item_name)
+        base = (it.item_name or it.item_code or "product").strip()
+    except Exception:
+        base = item_name or "product"
+
+    slug = unicodedata.normalize("NFKD", base).encode("ascii", "ignore").decode("ascii").lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", slug)
+    slug = re.sub(r"-{2,}", "-", slug).strip("-")[:60] or "product"
+
+    new_file_name = f"{slug}-{new_hash[:8]}.webp"
+    is_private = 0 if make_public else 1
+
+    new_file_doc = save_file(
+        new_file_name,
         edited_webp,
         "Item",
         item_name,
-        is_private=0 if make_public else 1,
+        is_private=is_private,
+        decode=False,
     )
+    new_fdoc = frappe.get_doc("File", new_file_doc) if isinstance(new_file_doc, str) else new_file_doc
+    new_url = (new_fdoc.file_url or "").strip()
 
-    # Delete the original file
-    try:
-        original_file_doc = frappe.get_doc("File", frow["name"])
-        original_file_doc.delete()
+    if new_fdoc.meta.has_field("custom_treated_ai"):
+        new_fdoc.custom_treated_ai = 1
+    if _has_db_column("File", "content_hash"):
+        new_fdoc.content_hash = new_hash
+    if _has_db_column("File", "file_size"):
+        new_fdoc.file_size = new_size
+
+    new_fdoc.save(ignore_permissions=True)
+    frappe.db.commit()
+
+    meta = _ensure_wp_meta_for_file(file_name=new_fdoc.name, item_name=item_name, gemini_client=gemini_client, alt_locale=alt_locale)
+    frappe.db.commit()
+
+    # Update current item fields if they were pointing to old_url
+    it_doc = frappe.get_doc("Item", item_name)
+    changed_current_fields: List[str] = []
+    for fieldname in _get_item_attach_fields():
+        if it_doc.meta.has_field(fieldname) and (getattr(it_doc, fieldname, None) or "").strip() == old_url:
+            setattr(it_doc, fieldname, new_url)
+            changed_current_fields.append(fieldname)
+    if changed_current_fields:
+        it_doc.save(ignore_permissions=True)
         frappe.db.commit()
-    except Exception as e:
-        frappe.log_error(f"Failed to delete original file {frow['name']}: {str(e)}")
 
-    # Build absolute URL for ALT text generation (if public)
-    abs_url = fdoc.file_url
-    if abs_url and not abs_url.lower().startswith(("http://", "https://")):
-        abs_url = urljoin(get_url(), abs_url)
+    # Relink other items/files
+    relink_summary = _relink_old_url_for_other_items_only(
+        current_item=item_name,
+        old_url=old_url,
+        new_url=new_url,
+        new_file_name=new_file_name,
+        new_hash=new_hash,
+        new_size=new_size,
+    )
+    frappe.db.commit()
 
-    alt = ""
-    try:
-        if make_public and abs_url.lower().startswith(("http://", "https://")):
-            alt = _gemini_generate_alt(client, abs_url, alt_locale)
-    except Exception:
-        alt = ""
+    delete_summary = {"deleted": False}
+    if delete_old_if_replaced:
+        delete_summary = _safe_delete_file_if_unreferenced(fdoc.name)
 
     return {
-        "original_file_url": frow.get("file_url"),
-        "original_file_name": frow.get("file_name"),
-        "processed_file_url": fdoc.file_url,
-        "processed_file_name": fdoc.file_name,
-        "content_description": content_filename,
-        "alt": alt,
-        "is_private": fdoc.is_private,
-        "original_deleted": True,
         "skipped": False,
+        "mode": "new_file_and_relink",
+        "file": fdoc.name,
+        "new_file": new_fdoc.name,
+        "original_file_url": old_url,
+        "processed_file_url": new_url,
+        "relink": relink_summary,
+        "delete_old": delete_summary,
+        "content_hash": new_hash,
+        "file_size": new_size,
+        "custom_wp_title": meta.get("custom_wp_title"),
+        "alt": meta.get("custom_wp_alternative"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Public API: retouch all item images (dedupe par file_url)
+# ---------------------------------------------------------------------------
 
 @frappe.whitelist()
 def retouch_item_images(
     item_name: str,
-    max_images: int = 1,
+    max_images: int = 10,
     make_public: int = 1,
     set_website_image: int = 1,
     write_alt_to_field: str = "",
     alt_locale: str = "fr",
 ) -> Dict[str, Any]:
     """
-    Retouch up to `max_images` attached images for an Item and save them as NEW files.
-    Optionally set Item.image with the first processed image, and store ALT text.
+    Retouches Item attachments safely while PRESERVING the original file ordering.
+
+    Rules:
+      - Pull all File rows attached to the Item, ordered by (is_private asc, creation asc)
+      - Keep only image-like files
+      - Dedupe by file_url (keep the first occurrence, preserve order)
+      - If Item.image exists and matches one of the attached file_url -> process it FIRST
+        (then append remaining files in original order)
+      - Process up to max_images in that final order
+      - Ordering is preserved EVEN if some images are skipped (already treated) or replaced
+      - Main image behavior:
+          * If it.image is already set: DO NOT override it
+              - but if that URL was replaced -> update it.image to the new URL
+          * If it.image is empty: set it to the first URL in the final ordered list (if set_website_image=1)
     """
     it = frappe.get_doc("Item", item_name)
-    client = _get_gemini_client()
+    gemini_client = _get_gemini_client()
 
-    # Filter out AI-generated files from the query
-    files = frappe.get_all(
+    rows = frappe.get_all(
         "File",
-        filters={
-            "attached_to_doctype": "Item", 
-            "attached_to_name": it.name,
-            "file_name": ["not like", "%ai-gen%"]  # Exclude AI-generated files
-        },
+        filters={"attached_to_doctype": "Item", "attached_to_name": it.name},
         fields=["name", "file_url", "file_name", "is_private", "creation"],
         order_by="is_private asc, creation asc",
-        limit_page_length=100,
+        limit_page_length=500,
     )
     
+    # ---- helpers ----
+    from urllib.parse import urlparse
+
+    def _norm_url(u: str) -> str:
+        u = (u or "").strip()
+        if not u:
+            return ""
+        p = urlparse(u)
+        # If absolute URL, compare by path; otherwise keep relative
+        return (p.path or "").strip() if p.scheme else u
+
+    def _move_item_image_first(files_: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        img = _norm_url(getattr(it, "image", "") or "")
+        if not img:
+            return files_
+
+        idx = None
+        for i, f in enumerate(files_):
+            if _norm_url(f.get("file_url")) == img:
+                idx = i
+                break
+
+        if idx is None:
+            return files_  # it.image not among attachments -> keep order
+
+        return [files_[idx]] + [f for j, f in enumerate(files_) if j != idx]
+
+    # ---- keep only images + dedupe by file_url (preserve order) ----
+    seen = set()
+    files: List[Dict[str, Any]] = []
+
+    for r in rows:
+        if not _is_probably_image_file(r.get("file_name"), r.get("file_url")):
+            continue
+
+        u = (r.get("file_url") or "").strip()
+        if not u:
+            continue
+
+        # dedupe by normalized url so absolute/relative doesn't create duplicates
+        key = _norm_url(u)
+        if not key or key in seen:
+            continue
+
+        seen.add(key)
+        files.append(r)
+
     if not files:
-        return {"ok": False, "item": it.name, "message": "No non-AI-generated attached images found."}
+        return {"ok": False, "item": it.name, "message": "No attached images found."}
+
+    # Process it.image first if it's one of the attachments (does NOT change ERPNext main image)
+    files = _move_item_image_first(files)
+
+    # Apply max_images after final ordering
+    files = files[: int(max_images)]
 
     results: List[Dict[str, Any]] = []
-    processed_urls: List[str] = []
+    ordered_final_urls: List[str] = []
+    url_map: Dict[str, str] = {}  # original_norm_url -> final_url (after replace/overwrite)
 
-    for frow in files:
-        if len(results) >= int(max_images):
-            break
-        try:
-            out = _retouch_one_attachment(
-                client=client,
-                item_name=it.name,
-                frow=frow,
-                make_public=bool(int(make_public)),
-                alt_locale=alt_locale,
-            )
-            results.append(out)
-            if out.get("processed_file_url") and not out.get("skipped"):
-                processed_urls.append(out["processed_file_url"])
-        except Exception as e:
-            results.append({"original_file_url": frow.get("file_url"), "error": str(e)})
+    for r in files:
+        out = _retouch_one_attachment(
+            gemini_client=gemini_client,
+            item_name=it.name,
+            file_docname=r["name"],
+            make_public=bool(int(make_public)),
+            alt_locale=alt_locale,
+            delete_old_if_replaced=True,
+        )
+        results.append(out)
 
-    if processed_urls and int(set_website_image):
-        first_url = processed_urls[0]
-        it.image = first_url
+        original_url = (out.get("original_file_url") or "").strip()
+        final_url = (out.get("processed_file_url") or out.get("original_file_url") or "").strip()
+
+        # IMPORTANT: preserve ordering regardless of skipped/replaced
+        if final_url:
+            ordered_final_urls.append(final_url)
+
+        # map original -> final (use normalized original for matching current it.image)
+        orig_key = _norm_url(original_url)
+        if orig_key and final_url:
+            url_map[orig_key] = final_url
+
+    # ---- main image logic (conservative; no override) ----
+    if int(set_website_image):
+        current = (it.image or "").strip()
+
+        if current:
+            # If current main image was replaced, update it to the new URL
+            mapped = url_map.get(_norm_url(current))
+            if mapped and mapped != current:
+                it.image = mapped
+        else:
+            # If no main image set, pick the first in final order
+            if ordered_final_urls:
+                it.image = ordered_final_urls[0]
+
+        # optional: write an alt field from the first non-empty alt we produced
         if write_alt_to_field and it.meta.has_field(write_alt_to_field):
-            alt = next((r.get("alt") for r in results if r.get("alt")), "")
+            alt = ""
+            for x in results:
+                candidate = (x.get("alt") or "").strip()
+                if candidate:
+                    alt = candidate
+                    break
             if alt:
                 setattr(it, write_alt_to_field, alt)
+
         it.save(ignore_permissions=True)
         frappe.db.commit()
 
-    return {"ok": True, "item": it.name, "processed": results}
+    return {
+        "ok": True,
+        "item": it.name,
+        "processed": results,
+        "ordered_final_urls": ordered_final_urls,  # debug + later use for Woo ordering
+    }
+
+
 
 @frappe.whitelist()
 def generate_website_contenant(item_name: str) -> Dict[str, Any]:
@@ -2209,7 +2805,7 @@ def generate_website_contenant(item_name: str) -> Dict[str, Any]:
     MAX_IMAGES_RETOUCH = 10
     MAKE_PUBLIC = 1
     SET_WEBSITE_IMAGE = 1
-    WRITE_ALT_TO_FIELD = ""         # e.g., "custom_image_alt" if you have one
+    WRITE_ALT_TO_FIELD = ""         # e.g., "" if you have one
     ALT_LOCALE = "fr"
 
 
@@ -2237,14 +2833,16 @@ def generate_website_contenant(item_name: str) -> Dict[str, Any]:
     # --- step 2: image retouch / ALT / website image ---
     images_res = {}
     try:
-        images_res = retouch_item_images(
-            item_name=item_name,
-            max_images=MAX_IMAGES_RETOUCH,
-            make_public=MAKE_PUBLIC,
-            set_website_image=SET_WEBSITE_IMAGE,
-            write_alt_to_field=WRITE_ALT_TO_FIELD,
-            alt_locale=ALT_LOCALE,
-        )
+        dedupe_item_images(item_name=item_name, dry_run=False, detach_missing=True)
+        images_res=treat_left_item_images(item_name=item_name)
+        # images_res = retouch_item_images(
+        #     item_name=item_name,
+        #     max_images=MAX_IMAGES_RETOUCH,
+        #     make_public=MAKE_PUBLIC,
+        #     set_website_image=SET_WEBSITE_IMAGE,
+        #     write_alt_to_field=WRITE_ALT_TO_FIELD,
+        #     alt_locale=ALT_LOCALE,
+        # )
     except Exception as e:
         frappe.log_error(frappe.get_traceback(), "generate_website_contenant: image retouch failed")
         images_res = {"ok": False, "error": str(e)}
@@ -2255,3 +2853,283 @@ def generate_website_contenant(item_name: str) -> Dict[str, Any]:
         "content": content_res,
         "images": images_res,
     }
+# Treat image file
+def _make_main_first(it, rows):
+    # 1) prefer attached_to_field="image"
+    for i, r in enumerate(rows):
+        if r.get("attached_to_field") == "image":
+            return [rows[i]] + [x for j, x in enumerate(rows) if j != i]
+    # 2) else match file_url to it.image
+    img = (it.image or "").split("?")[0]
+    if img:
+        for i, r in enumerate(rows):
+            if (r.get("file_url") or "").split("?")[0] == img:
+                return [rows[i]] + [x for j, x in enumerate(rows) if j != i]
+    return rows
+def _principal_keyword(it) -> str:
+    txt = it.custom_seo_keywords
+    parts = txt.split(",") if txt else []
+    parts = [p.strip() for p in parts if p.strip()]
+    return parts[0] if parts else ""
+
+def _generate_wp_alt(image_bytes: bytes, it, locale: str = "fr") -> str:
+    """
+    Generate SEO alt text using:
+      - image content (vision)
+      - base (item_name/item_code)
+      - principal keyword (MUST be included exactly)
+      - item description
+    """
+    base = (it.item_name or it.item_code or it.name or "").strip()
+    kw = _principal_keyword(it)  # must be exact keyword you want
+    desc = (getattr(it, "description", None) or getattr(it, "website_description", None) or "").strip()
+    alt = _openai_generate_alt_from_bytes(
+        image_bytes,
+        locale=locale,
+        base=base,
+        principal_keyword=kw,
+        description=desc,
+        max_chars=180,  # change if you want
+    )
+
+    # safety fallback if OpenAI fails
+    if not (alt or "").strip():
+        if locale == "fr":
+            return f"{kw} {base}".strip()
+        return f"{kw} {base}".strip()
+
+    return alt
+
+@frappe.whitelist()
+def treat_left_item_images(item_name: str, max_images: int = 10, preserve_order: int = 1):
+    """
+    Step 2 (after dedupe):
+      - for each attached image File where custom_treated_ai == 0:
+          * treat with Gemini
+          * attach NEW treated file to the item
+          * detach OLD file from the item
+          * (optional) copy creation timestamp so it stays "in its place"
+    """
+    it = frappe.get_doc("Item", item_name)
+    gemini_client = _get_gemini_client()
+    rows = frappe.get_all(
+        "File",
+        filters={"attached_to_doctype": "Item", "attached_to_name": it.name},
+        fields=[
+            "name", "file_url", "file_name", "is_private", "creation", "attached_to_field",
+            "custom_treated_ai", "custom_wp_title", "custom_wp_alternative"
+        ],
+        order_by="is_private asc, creation asc",
+        limit_page_length=500,
+    )
+
+    # keep only images
+    rows = [r for r in rows if _is_image_url( r.get("file_url"))]
+    if not rows:
+        return {"ok": False, "item": it.name, "message": "No image files attached."}
+
+    # first must be main image
+    rows = _make_main_first(it, rows)
+    rows = rows[: int(max_images)]
+
+    actions = []
+    i=0
+    for r in rows:
+        i+=1
+        old_id = r["name"]
+        old_doc = frappe.get_doc("File", old_id)
+            # ✅ Always ensure WP fields exist (independent from treated)
+        if hasattr(old_doc, "custom_wp_title") and not (old_doc.custom_wp_title or "").strip():
+            old_doc.custom_wp_title = f"{it.name}_{i}"  # or item_code-i
+
+        if hasattr(old_doc, "custom_wp_alternative") and not (old_doc.custom_wp_alternative or "").strip():
+            try:
+                img_bytes_for_alt = old_doc.get_content()
+                old_doc.custom_wp_alternative = _generate_wp_alt(img_bytes_for_alt, it)
+            except Exception:
+                # keep empty or put fallback
+                old_doc.custom_wp_alternative = (it.item_name or it.name or "").strip()
+
+        old_doc.save(ignore_permissions=True)
+
+        treated = int(getattr(old_doc, "custom_treated_ai", 0) or 0)
+        if treated == 1:
+            continue
+
+        # read bytes from old file
+        old_bytes = old_doc.get_content()
+
+        # treat with gemini
+        new_bytes = _gemini_edit_image_bytes(gemini_client, old_bytes)
+        # new_bytes, ext = gemini_treat_image_bytes(gemini_client, old_bytes)
+        ext = ".jpg"
+
+        # create NEW treated file attached to same item
+        new_name = f"{it.name}_{str(i)}{ext}"
+        new_doc = save_file(
+            fname=new_name,
+            content=new_bytes,
+            dt="Item",
+            dn=it.name,
+            is_private=int(old_doc.is_private or 0),
+        )
+
+        # keep same attached_to_field (important for main image file)
+        if getattr(old_doc, "attached_to_field", None):
+            new_doc.attached_to_field = old_doc.attached_to_field
+            new_doc.save(ignore_permissions=True)
+
+        # if old one was the 'image' field, update item.image to new url
+        if getattr(old_doc, "attached_to_field", None) == "image":
+            it.image = new_doc.file_url
+
+        # copy WP fields if you already set them on old file
+        for fld in ("custom_wp_title", "custom_wp_alternative"):
+            if hasattr(old_doc, fld) and hasattr(new_doc, fld):
+                if not (getattr(new_doc, fld, "") or "").strip():
+                    val = (getattr(old_doc, fld, "") or "").strip()
+                    if val:
+                        setattr(new_doc, fld, val)
+
+        # mark new treated flag (on new file)
+        if hasattr(new_doc, "custom_treated_ai"):
+            new_doc.custom_treated_ai = 1
+        new_doc.save(ignore_permissions=True)
+
+        # OPTIONAL: keep ordering slot by copying creation timestamp
+        if int(preserve_order):
+            frappe.db.sql(
+                "UPDATE `tabFile` SET creation=%s WHERE name=%s",
+                (old_doc.creation, new_doc.name),
+            )
+
+        # detach the OLD file from item (only unlink)
+        _detach_file_doc(old_id)
+
+        actions.append({
+            "old_file": old_id,
+            "new_file": new_doc.name,
+            "old_url": old_doc.file_url,
+            "new_url": new_doc.file_url,
+            "field": getattr(old_doc, "attached_to_field", None),
+        })
+
+    it.save(ignore_permissions=True)
+    frappe.db.commit()
+
+    return {"ok": True, "item": it.name, "treated_count": len(actions), "actions": actions}
+
+def estimate_weight_and_delivery_class(
+    openai_client,
+    model: str,
+    images: List[str],
+    context: List[str],
+) -> Dict[str, Any]:
+    """
+    Estimates packaged weight (kg) and whether the product is volumineux (bulky),
+    using product description + up to 3 images.
+
+    Parameters:
+    -----------
+    openai_client:
+        OpenAI client instance.
+    model: str
+        Vision-capable model (e.g., gpt-4o, gpt-4.1, gpt-5...).
+    images: List[str]
+        Image URLs (prefer 1-3 clear images). If empty, model uses text only.
+    context: List[str]
+        [product_name, short_description] (description can include specs/dimensions/keywords).
+
+    Returns:
+    --------
+    result: Dict[str, Any]
+        STRICT JSON:
+        {
+          "weight_kg": number|null,
+          "is_volumineux": true|false|null,
+          "delivery_class": "normal"|"lourd"|"volumineux",
+          "confidence": "high"|"medium"|"low",
+          "reasons": [..],
+          "missing_info": [..],
+          "sources": [image_urls..]
+        }
+    """
+
+    product_name = context[0] if context else ""
+    short_description = context[1] if len(context) > 1 else ""
+    description = context[2] if len(context) > 2 else ""
+
+    # Build user message parts
+    user_payload = {
+        "task": (
+            "Estimate packaged weight (kg) and whether the product is bulky/volumineux. "
+            "Use both the text context and the images. "
+            "Use images mainly to detect bulky/oversized packaging or any visible labels (weight/dimensions)."
+            "If no information given use your knowledge"
+        ),
+        "rules": [
+            "Output ONLY valid JSON (no markdown).",
+            "Keys MUST be: weight_kg, is_volumineux",
+        ],
+        "context_fields": {
+            "product_name": product_name,
+            "short_description": short_description,
+            "description": description
+        },
+        "schema_example": {
+            "weight_kg": None,
+            "is_volumineux": None
+        }
+    }
+
+    user_content = [{"type": "text", "text": json.dumps(user_payload, ensure_ascii=False)}]
+
+    # Attach up to 3 images
+    for u in (images or [])[:3]:
+        user_content.append({"type": "image_url", "image_url": {"url": u, "detail": "high"}})
+
+    params = {
+        "model": model,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+    "You are a logistics estimator for e-commerce products.\n"
+    "Your task is to infer packaged weight (kg) and whether the item is bulky (volumineux) "
+    "from the provided text and images.\n\n"
+    "PRIORITIES:\n"
+    "1) If a weight/dimensions label is visible, use it.\n"
+    "2) If the text contains weight/dimensions/specs, use them.\n"
+    "3) If neither exists, be conservative: only estimate weight if you can infer it reasonably from product type;\n\n"
+    "VOLMINEUX GUIDANCE:\n"
+    "- Set is_volumineux = true only when there are clear cues of oversized/bulky packaging or special handling: "
+    "large tanks/FRP vessels, large housings, skid-mounted industrial units, big cabinets, pallet-sized packages.\n"
+    "- Set is_volumineux = false for standard small/medium items: cartridges (PP/UDF/CTO), membranes, faucets, UV lamps, fittings, "
+    "and typical domestic/commercial RO units unless there is clear evidence of bulky packaging.\n\n"
+
+    "OUTPUT:\n"
+    "- Return STRICT JSON only. No markdown, no extra text.\n"
+),
+            },
+            {"role": "user", "content": user_content},
+        ],
+    }
+
+    # keep deterministic for non gpt-5 models
+    if not str(model).lower().startswith("gpt-5"):
+        params["temperature"] = 0.01
+
+    res = openai_client.chat.completions.create(**params)
+
+    # Parse JSON safely
+    try:
+        raw = res.choices[0].message.content or "{}"
+        result = json.loads(raw)
+    except Exception:
+        result = {}
+
+    # Ensure sources
+    result = result or {}
+    
+    return result

@@ -1,0 +1,72 @@
+[
+  {
+    "doctype": "DocType",
+    "name": "AI Settings",
+    "module": "WooCommerce Fusion",
+    "custom": 1,
+    "istable": 0,
+    "issingle": 1,
+    "is_submittable": 0,
+    "track_changes": 1,
+    "allow_rename": 0,
+    "read_only": 0,
+    "permissions": [
+      {
+        "role": "System Manager",
+        "read": 1,
+        "write": 1,
+        "create": 1,
+        "delete": 1,
+        "report": 1,
+        "export": 1,
+        "print": 1,
+        "email": 1,
+        "share": 1
+      }
+    ],
+    "fields": [
+      {
+        "fieldname": "openai_section",
+        "label": "OpenAI",
+        "fieldtype": "Section Break"
+      },
+      {
+        "fieldname": "openai_api_key",
+        "label": "OpenAI API Key",
+        "fieldtype": "Data"
+      },
+      {
+        "fieldname": "open_ai_model",
+        "label": "OpenAI Model",
+        "fieldtype": "Data",
+        "default": "gpt-4o-mini",
+        "description": "Example: gpt-4o-mini"
+      },
+      {
+        "fieldname": "open_ai_temperature",
+        "label": "OpenAI Temperature",
+        "fieldtype": "Float",
+        "default": "0.2",
+        "description": "0 = deterministic, higher = more random"
+      },
+
+      {
+        "fieldname": "gemini_section",
+        "label": "Gemini",
+        "fieldtype": "Section Break"
+      },
+      {
+        "fieldname": "gemini_api_key",
+        "label": "Gemini API Key",
+        "fieldtype": "Data"
+      },
+      {
+        "fieldname": "gemini_model",
+        "label": "Gemini Model",
+        "fieldtype": "Data",
+        "default": "gemini-2.5-flash-image-preview",
+        "description": "Example: gemini-2.5-flash-image-preview"
+      }
+    ]
+  }
+]
