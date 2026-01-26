@@ -1172,6 +1172,8 @@ import os
 import hashlib
 import frappe
 from frappe.utils.file_manager import get_file
+import io
+from PIL import Image, ImageOps
 import pdb
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
@@ -1349,84 +1351,162 @@ def _detach_file_doc(file_docname: str, note: str = ""):
     f.save(ignore_permissions=True)
 
 
+def _dhash_int_from_bytes(content: bytes, hash_size: int = 8) -> int:
+    img = Image.open(io.BytesIO(content))
+    img = ImageOps.exif_transpose(img)          # fix rotation from phones
+    img = img.convert("L").resize((hash_size + 1, hash_size))
+    px = list(img.getdata())
+
+    bits = 0
+    for y in range(hash_size):
+        row = y * (hash_size + 1)
+        for x in range(hash_size):
+            bits = (bits << 1) | (1 if px[row + x] > px[row + x + 1] else 0)
+    return bits
+
+def _hamming(a: int, b: int) -> int:
+    return (a ^ b).bit_count()
+
+def _dhash_of_media(m: dict, cache: dict):
+    """
+    Returns int dhash or None
+    Cache key is based on file_docname or file_url.
+    """
+    file_id = m.get("file_docname")
+    if file_id:
+        ck = ("dhash_file", file_id)
+        if ck in cache:
+            return cache[ck]
+        try:
+            content = frappe.get_doc("File", file_id).get_content()
+            if not content:
+                cache[ck] = None
+                return None
+            h = _dhash_int_from_bytes(content)
+            cache[ck] = h
+            return h
+        except Exception:
+            cache[ck] = None
+            return None
+
+    file_url = (m.get("file_url") or "").split("?")[0]
+    if not file_url:
+        return None
+
+    ck = ("dhash_url", file_url)
+    if ck in cache:
+        return cache[ck]
+
+    try:
+        _path, content = get_file(file_url)
+        if not content:
+            cache[ck] = None
+            return None
+        h = _dhash_int_from_bytes(content)
+        cache[ck] = h
+        return h
+    except Exception:
+        cache[ck] = None
+        return None
+
+
 @frappe.whitelist()
-def dedupe_item_images(item_name: str, dry_run: bool = True, detach_missing: bool = False):
-    """
-    Step 1:
-    - Keep item.image (primary) always.
-    - For attachments: if duplicate by SHA256 => detach File doc from this Item.
-    - If a file can't be read:
-        - primary: keep but report as missing
-        - attachment: either keep+report or detach if detach_missing=True
-    """
+def dedupe_item_images(item_name: str, dry_run: bool = True, detach_missing: bool = False,
+                      use_dhash: bool = True, dhash_threshold: int = 4):
+
     item, media = _list_item_media(item_name)
-    
+
     cache = {}
     missing = []
 
-    # compute signatures (robust)
+    # compute sha + dhash
     for m in media:
         m["sig"] = _sha256_of_media(m, cache)
         if m["sig"] is None:
             missing.append(m)
 
+        if use_dhash:
+            m["dhash"] = _dhash_of_media(m, cache)
+        else:
+            m["dhash"] = None
+
     kept = []
     duplicates = []
-    seen = set()
+    seen_sha = set()
+    kept_hashes = []   # store dhash of kept images (primary + kept attachments)
 
     for m in media:
-        # primary always kept (even if sig is None)
+        # primary always kept
         if m["role"] == "primary":
             kept.append(m)
             if m["sig"]:
-                seen.add(m["sig"])
+                seen_sha.add(m["sig"])
+            if use_dhash and m["dhash"] is not None:
+                kept_hashes.append(m["dhash"])
             continue
 
-        # attachment with missing sig
-        if m["sig"] is None:
+        # unreadable attachment
+        if m["sig"] is None and (not use_dhash or m["dhash"] is None):
             if (not dry_run) and detach_missing and m.get("file_docname"):
-                _detach_file_doc(m["file_docname"], note=f"[AI_PIPELINE] Detached unreadable/missing file on Item {item.name}")
-                frappe.db.commit()
+                _detach_file_doc(m["file_docname"])
             else:
-                kept.append(m)  # keep it but it won't participate in dedupe
+                kept.append(m)
             continue
 
-        # dedupe
-        if m["sig"] in seen:
-            duplicates.append(m)
-        else:
-            kept.append(m)
-            seen.add(m["sig"])
+        # 1) exact duplicate by sha256
+        if m["sig"] and m["sig"] in seen_sha:
+            duplicates.append({**m, "dup_reason": "sha256"})
+            continue
 
-    # detach duplicates (safe)
-    
+        # 2) perceptual duplicate by dhash (similar image)
+        if use_dhash and m["dhash"] is not None and kept_hashes:
+            is_similar = False
+            best_dist = None
+            for h in kept_hashes:
+                dist = _hamming(m["dhash"], h)
+                if best_dist is None or dist < best_dist:
+                    best_dist = dist
+                if dist <= int(dhash_threshold):
+                    is_similar = True
+                    break
+            if is_similar:
+                duplicates.append({**m, "dup_reason": "dhash", "distance": best_dist})
+                continue
+
+        # keep it
+        kept.append(m)
+        if m["sig"]:
+            seen_sha.add(m["sig"])
+        if use_dhash and m["dhash"] is not None:
+            kept_hashes.append(m["dhash"])
+
+    # detach duplicates
     if not dry_run:
         for d in duplicates:
             if d.get("file_docname"):
-                _detach_file_doc(
-                    d["file_docname"],
-                    note=f"[AI_PIPELINE] Detached as duplicate on Item {item.name}. Kept another file with same SHA256."
-                )
-                frappe.db.commit()
+                _detach_file_doc(d["file_docname"])
+
+        frappe.db.commit()
 
     return {
         "item": item.name,
         "dry_run": dry_run,
+        "use_dhash": use_dhash,
+        "dhash_threshold": dhash_threshold,
         "total_images_found": len(media),
         "kept_count": len(kept),
         "duplicate_count": len(duplicates),
         "missing_count": len(missing),
-        "missing": [
-            {"role": x["role"], "file_url": x.get("file_url"), "file_docname": x.get("file_docname")}
-            for x in missing
-        ],
-        "kept": [
-            {"role": k["role"], "file_url": k.get("file_url"), "file_docname": k.get("file_docname"), "sig": k.get("sig")}
-            for k in kept
-        ],
         "duplicates_detached": [
-            {"file_url": d.get("file_url"), "file_docname": d.get("file_docname"), "sig": d.get("sig")}
+            {
+                "file_url": d.get("file_url"),
+                "file_docname": d.get("file_docname"),
+                "sig": d.get("sig"),
+                "dup_reason": d.get("dup_reason"),
+                "distance": d.get("distance"),
+            }
             for d in duplicates
         ],
     }
+
 
