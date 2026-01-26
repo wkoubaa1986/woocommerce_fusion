@@ -692,7 +692,7 @@ class SynchroniseItem(SynchroniseWooCommerce):
 			if not self.woocommerce_product:
 				rows = frappe.get_all(
 					"Item WooCommerce Server",
-					filters={"parenttype": "Item", "parent": 'AP-P'},
+					filters={"parenttype": "Item", "parent": self.item.item.name},
 					fields=["woocommerce_server"],
 					order_by="idx asc",
 					limit=1,
