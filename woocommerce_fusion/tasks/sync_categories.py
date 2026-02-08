@@ -178,6 +178,7 @@ def ensure_category(item_group, wc_api):
         return {"status": "updated", "wc_category_id": wc_id, "resp": resp}
 
     # CASE 2: Not mapped yet or deleted -> create
+
     new_cat = wc_api.post("products/categories", payload).json()
     wc_id = new_cat.get("id")
     frappe.db.set_value("Item Group", item_group.name, "custom_woocommerce_id", wc_id)

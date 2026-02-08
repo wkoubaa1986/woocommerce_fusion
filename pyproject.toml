@@ -9,7 +9,9 @@ readme = "README.md"
 dynamic = ["version"]
 dependencies = [
     "woocommerce~=3.0.0",
-    "jsonpath-ng~=1.7.0"
+    "jsonpath-ng~=1.7.0",
+    "openai>=1.40",
+    "google-genai>=0.2.0",
 ]
 
 [build-system]

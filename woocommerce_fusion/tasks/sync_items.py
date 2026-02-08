@@ -740,6 +740,7 @@ class SynchroniseItem(SynchroniseWooCommerce):
 				"attributes": _safe_json_list(getattr(self.woocommerce_product, "attributes", None)),
 				"categories": [],
 				"tags": [],
+				"meta_data": [],
 			}
 
 
@@ -756,6 +757,11 @@ class SynchroniseItem(SynchroniseWooCommerce):
 			main_group=sync_single_item_group(wc_server=self.woocommerce_product.woocommerce_server,item_group_name=self.item.item.item_group)
 			
 			payload["categories"].append({"id": main_group['wc_category_id']})
+			primary_cat_id = main_group['wc_category_id']
+			payload["meta_data"].append({
+				"key": "rank_math_primary_product_cat",
+				"value": primary_cat_id
+			})
 			list_categories=self.item.item.custom_woocomerce_categories
 			if list_categories:
 				categories = [c.strip() for c in list_categories.split(",")]
