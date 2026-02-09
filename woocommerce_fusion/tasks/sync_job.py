@@ -7,10 +7,10 @@ EXCLUDED_GROUPS = [
     "Contrats de maintenance",
     "Echange",
     "Livraison",
-    "Main d’œuvre",
+    "Main d'œuvre",
 ]
 
-@frappe.whitelist()
+# 🔥 Fonction interne (sans @whitelist) pour les jobs en queue
 def sync_active_items_batch(batch_size: int = 25, offset: int = 0):
     batch_size = int(batch_size or 25)
     offset = int(offset or 0)
@@ -49,7 +49,7 @@ def sync_active_items_batch(batch_size: int = 25, offset: int = 0):
             frappe.logger().exception(f"[SYNC] Failed item={item_code}")
             frappe.db.rollback()
 
-    # 🔥 ENQUEUE SEULEMENT ICI (après traitement)
+    # Enqueue le prochain batch
     next_offset = offset + batch_size
 
     frappe.enqueue(
@@ -67,4 +67,26 @@ def sync_active_items_batch(batch_size: int = 25, offset: int = 0):
         "processed": len(items),
         "failed": failed,
         "next_offset": next_offset,
+    }
+
+
+# 🔥 Fonction API séparée (avec @whitelist) pour démarrer le sync
+@frappe.whitelist()
+def start_sync(batch_size: int = 25, offset: int = 0):
+    """Démarre la synchronisation des articles actifs."""
+    batch_size = int(batch_size or 25)
+    offset = int(offset or 0)
+    
+    frappe.enqueue(
+        method="woocommerce_fusion.tasks.sync_job.sync_active_items_batch",
+        queue="long",
+        timeout=2 * 60 * 60,
+        job_name=f"Sync batch offset={offset}",
+        batch_size=batch_size,
+        offset=offset,
+    )
+    
+    return {
+        "status": "started",
+        "message": f"Synchronisation démarrée avec batch_size={batch_size}, offset={offset}"
     }
