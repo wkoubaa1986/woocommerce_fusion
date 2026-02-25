@@ -2231,30 +2231,54 @@ def _ensure_wp_meta_for_file(
 # ---------------------------------------------------------------------------
 
 EDIT_PROMPT = (
-    "E-commerce product image edit with STRICT centering and sizing requirements:\n\n"
-    "BACKGROUND & CLEANUP:\n"
-    "- Background: remove completely and replace with pure white (#FFFFFF); absolutely no gradients, textures, or shadows on background.\n"
-    "- Remove overlays: erase any non-product text/graphics such as phone numbers, URLs, emails, QR codes, stickers, badges, watermarks, price tags, or icons. PRESERVE product labels/logos that are part of the product itself.\n\n"
-    "CANVAS & OUTPUT:\n"
-    "- Canvas: exactly 1024×1024 pixels (perfect square).\n"
-    "- Output: high-quality WebP format on pure white background.\n\n"
-    "CRITICAL SIZING & CENTERING (FOLLOW PRECISELY):\n"
-    "1. MEASURE the product's bounding box (width and height) EXCLUDING any shadow you will add.\n"
-    "2. CALCULATE the maximum scale factor: min(950/product_width, 950/product_height).\n"
-    "3. SCALE the product so its largest dimension is 900-950 pixels.\n"
-    "4. CENTER EXACTLY at (512, 512).\n"
-    "5. VERIFY equal white space on all sides (35-60 pixels margin).\n\n"
-    "SHADOW (AFTER CENTERING):\n"
-    "- Add a subtle, soft drop shadow UNDER the product only (10-15% opacity, natural blur).\n"
-    "- Shadow must not affect product positioning.\n\n"
-    "QUALITY REQUIREMENTS:\n"
-    "- Preserve product exactly as-is, same colors, textures, proportions.\n"
-    "- Light sharpening and denoising.\n"
-    "- Clean edges, no halos.\n\n"
-    "PROHIBITIONS:\n"
-    "- NO stretching.\n"
-    "- NO added text/graphics/borders/watermarks/props.\n"
-    "- NO off-center positioning.\n"
+    """You receive one or multiple photos of the SAME product.
+The product can be:
+- A water tank / cistern / reservoir
+- A valve / faucet
+- A pipe, PVC/PE fitting, connector, or plumbing accessory
+
+Your task:
+Generate ONE single, high-quality, professional e-commerce packshot
+of this exact product.
+
+Reference usage:
+- Carefully analyze the input photo(s).
+- Reproduce the EXACT same product.
+- Preserve 100% of the original:
+  shape, geometry, proportions, capacity, ports, flanges,
+  thread types, valve handle design, surface texture,
+  colors, logos, labels, engravings, graduations and markings.
+- If multiple images are provided, combine them to improve accuracy.
+- Do NOT invent, redesign, simplify, or modify the product.
+
+View and framing:
+- Show the product in a clean 3/4 angled front view.
+- The entire product must be fully visible (no cropped edges).
+- Keep correct proportions (no distortion or stretching).
+- Center the product.
+- Use a square 1:1 format.
+- The product should fill about 85–90% of the frame
+  with small, even white margins around it.
+
+Background and lighting:
+- Pure white seamless studio background (#FFFFFF).
+- Soft, professional studio lighting.
+- Even illumination with no harsh reflections.
+- Soft, realistic shadow underneath and slightly behind the product.
+- No background texture.
+
+Restrictions:
+- Do NOT add extra elements.
+- No environment, no room, no installation context.
+- No people.
+- No additional text or graphics.
+- No watermarks.
+- No decorative props.
+
+Final result:
+A sharp, photorealistic, studio-quality 3/4 front view product packshot,
+accurately matching the reference product,
+ready for use on a professional e-commerce website."""
 )
 
 

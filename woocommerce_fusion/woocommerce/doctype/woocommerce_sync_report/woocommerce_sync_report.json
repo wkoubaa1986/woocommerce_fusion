@@ -1,0 +1,171 @@
+{
+ "actions": [],
+ "autoname": "format:SYNC-{YYYY}-{MM}-{DD}-{#####}",
+ "creation": "2026-02-15 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "status",
+  "sync_mode",
+  "started_at",
+  "completed_at",
+  "column_break_1",
+  "batch_size",
+  "current_batch_offset",
+  "total_batches",
+  "section_break_items",
+  "items",
+  "section_break_summary",
+  "total_items",
+  "success_count",
+  "failed_count",
+  "column_break_2",
+  "success_rate",
+  "duration_seconds"
+ ],
+ "fields": [
+  {
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Status",
+   "options": "Running\nCompleted\nFailed",
+   "reqd": 1,
+   "default": "Running"
+  },
+  {
+   "fieldname": "sync_mode",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Sync Mode",
+   "options": "all\nmodified",
+   "default": "all",
+   "reqd": 1,
+   "description": "all = Sync tous les items actifs | modified = Sync uniquement les items modifi\u00e9s"
+  },
+  {
+   "fieldname": "started_at",
+   "fieldtype": "Datetime",
+   "in_list_view": 1,
+   "label": "Started At",
+   "reqd": 1
+  },
+  {
+   "fieldname": "completed_at",
+   "fieldtype": "Datetime",
+   "label": "Completed At"
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "batch_size",
+   "fieldtype": "Int",
+   "label": "Batch Size",
+   "reqd": 1
+  },
+  {
+   "fieldname": "current_batch_offset",
+   "fieldtype": "Int",
+   "label": "Current Batch Offset",
+   "default": "0"
+  },
+  {
+   "fieldname": "total_batches",
+   "fieldtype": "Int",
+   "label": "Total Batches Processed",
+   "default": "0"
+  },
+  {
+   "fieldname": "section_break_items",
+   "fieldtype": "Section Break",
+   "label": "Synchronized Items"
+  },
+  {
+   "fieldname": "items",
+   "fieldtype": "Table",
+   "label": "Items",
+   "options": "WooCommerce Sync Report Item"
+  },
+  {
+   "fieldname": "section_break_summary",
+   "fieldtype": "Section Break",
+   "label": "Summary"
+  },
+  {
+   "fieldname": "total_items",
+   "fieldtype": "Int",
+   "label": "Total Items",
+   "read_only": 1,
+   "default": "0"
+  },
+  {
+   "fieldname": "success_count",
+   "fieldtype": "Int",
+   "label": "Success Count",
+   "read_only": 1,
+   "default": "0"
+  },
+  {
+   "fieldname": "failed_count",
+   "fieldtype": "Int",
+   "label": "Failed Count",
+   "read_only": 1,
+   "default": "0"
+  },
+  {
+   "fieldname": "column_break_2",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "success_rate",
+   "fieldtype": "Percent",
+   "label": "Success Rate",
+   "read_only": 1
+  },
+  {
+   "fieldname": "duration_seconds",
+   "fieldtype": "Int",
+   "label": "Duration (seconds)",
+   "read_only": 1
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2026-02-15 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "WooCommerce",
+ "name": "WooCommerce Sync Report",
+ "naming_rule": "Expression",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Stock Manager",
+   "share": 1
+  }
+ ],
+ "sort_field": "started_at",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

@@ -1,0 +1,144 @@
+{
+ "actions": [],
+ "autoname": "hash",
+ "creation": "2026-02-15 00:00:00.000000",
+ "default_view": "List",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "item_code",
+  "item_name",
+  "item_group",
+  "column_break_1",
+  "status",
+  "sync_date",
+  "batch_offset",
+  "section_break_error",
+  "error_message",
+  "error_traceback"
+ ],
+ "fields": [
+  {
+   "fieldname": "item_code",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Item Code",
+   "options": "Item",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fetch_from": "item_code.item_name",
+   "fieldname": "item_name",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Item Name",
+   "read_only": 1
+  },
+  {
+   "fetch_from": "item_code.item_group",
+   "fieldname": "item_group",
+   "fieldtype": "Link",
+   "in_standard_filter": 1,
+   "label": "Item Group",
+   "options": "Item Group",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Status",
+   "options": "Success\nFailed\nSkipped",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "sync_date",
+   "fieldtype": "Datetime",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Sync Date",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "batch_offset",
+   "fieldtype": "Int",
+   "label": "Batch Offset",
+   "read_only": 1
+  },
+  {
+   "depends_on": "eval:doc.status=='Failed'",
+   "fieldname": "section_break_error",
+   "fieldtype": "Section Break",
+   "label": "Error Details"
+  },
+  {
+   "fieldname": "error_message",
+   "fieldtype": "Text",
+   "label": "Error Message",
+   "read_only": 1
+  },
+  {
+   "fieldname": "error_traceback",
+   "fieldtype": "Code",
+   "label": "Error Traceback",
+   "options": "Python",
+   "read_only": 1
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2026-02-15 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "WooCommerce",
+ "name": "WooCommerce Item Sync Log",
+ "naming_rule": "Random",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Stock Manager",
+   "share": 1
+  },
+  {
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Stock User",
+   "share": 1
+  }
+ ],
+ "show_title_field_in_link": 1,
+ "sort_field": "sync_date",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "item_code",
+ "track_changes": 0
+}

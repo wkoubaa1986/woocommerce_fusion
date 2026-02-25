@@ -1,6 +1,7 @@
 import json
 from dataclasses import dataclass
 from datetime import datetime
+from math import prod
 from typing import List, Optional, Tuple
 import re
 import frappe
@@ -743,9 +744,9 @@ class SynchroniseItem(SynchroniseWooCommerce):
 				"meta_data": [],
 			}
 
-
 			if self.item.item.brand:
 				sync_brand(brand_name=self.item.item.brand, woocommerce_server=self.woocommerce_product.woocommerce_server)
+				
 				brand_id= frappe.db.get_value("Brand", {"brand": self.item.item.brand, "custom_woocomerce_server": self.woocommerce_product.woocommerce_server}, "custom_woocomerce_id")
 				payload["brands"].append({"id": brand_id})
 			if self.item.item.stock_uom:
@@ -799,7 +800,12 @@ class SynchroniseItem(SynchroniseWooCommerce):
 					wc_server.put(f"products/{woo_parent_id}", payload_P).json()
 
 			try:
+				print("Updating WC product with payload:", payload)
+				if not payload["brands"]:
+					payload["brands"] = [{}]
 				response = wc_server.put(f"products/{wc_id}", payload).json()
+				print(response.keys())
+				print(response.get("brands"))
 			except Exception as e:
 				frappe.log_error("WooCommerce Product Update Brand attribute Error", frappe.get_traceback())
 				return {

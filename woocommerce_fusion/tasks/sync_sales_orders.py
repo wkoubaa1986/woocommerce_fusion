@@ -22,7 +22,6 @@ from woocommerce_fusion.woocommerce.woocommerce_api import (
 	generate_woocommerce_record_name_from_domain_and_id,
 )
 from collections import defaultdict
-import pdb
 
 def run_sales_order_sync_from_hook(doc, method):
 	if (
@@ -50,7 +49,6 @@ def run_sales_order_sync(
 		raise ValueError(
 			"At least one of sales_order_name, sales_order, woocommerce_order_name, woocommerce_order is required"
 		)
-
 	# Get ERPNext Sales Order and WooCommerce Order if they exist
 	if woocommerce_order or woocommerce_order_name:
 		if not woocommerce_order:
@@ -105,6 +103,7 @@ def sync_woocommerce_orders_modified_since(date_time_from=None):
 
 	wc_orders = get_list_of_wc_orders(date_time_from=date_time_from)
 	wc_orders += get_list_of_wc_orders(date_time_from=date_time_from, status="trash")
+	
 	for wc_order in wc_orders:
 		try:
 			run_sales_order_sync(woocommerce_order=wc_order, enqueue=True)
@@ -112,7 +111,7 @@ def sync_woocommerce_orders_modified_since(date_time_from=None):
 		except Exception:
 			pass
 
-	frappe.db.set_single_value("WooCommerce Settings", "wc_last_sync_date_items", now())
+	frappe.db.set_single_value("WooCommerce Integration Settings", "wc_last_sync_date", now())
 
 
 class SynchroniseSalesOrder(SynchroniseWooCommerce):
@@ -134,7 +133,7 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		"""
 		Run synchronisation
 		"""
-
+		
 		try:
 			self.get_corresponding_sales_order_or_woocommerce_order()
 			self.sync_wc_order_with_erpnext_order()
@@ -197,7 +196,6 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		"""
 		Syncronise Sales Order between ERPNext and WooCommerce
 		"""
-
 		if self.sales_order and not self.woocommerce_order:
 			# create missing order in WooCommerce
 			pass
@@ -483,6 +481,7 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		"""
 		Create an ERPNext Sales Order from the given WooCommerce Order
 		"""
+		
 		customer_docname = self.create_or_link_customer_and_address(wc_order)
 		self.create_missing_items(wc_order, json.loads(wc_order.line_items), wc_order.woocommerce_server)
 		new_sales_order = frappe.new_doc("Sales Order")
@@ -549,6 +548,7 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		email = raw_billing_data.get("email", "").strip()
 		company_name = raw_billing_data.get("company", "").strip()
 		individual_name = f"{first_name} {last_name}".strip() or email
+		phone = raw_billing_data.get("phone", "").strip()
 
 		# Determine if the order is from a guest user
 		is_guest = wc_order.customer_id is None or wc_order.customer_id == 0
@@ -579,6 +579,41 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		existing_customer = frappe.get_value(
 			"Customer", {"woocommerce_identifier": customer_identifier}, "name"
 		)
+		
+		   # Additional verification: Check for existing customer by phone number
+		if not existing_customer and phone:
+			# Normalize the phone from WooCommerce order
+			normalized_phones_from_order = []
+			for num in normaliser_numero(phone):
+				if is_mobile_tunisien(num):
+					normalized_phones_from_order.append(num)
+			
+			if normalized_phones_from_order:
+				# Get all customers with custom_liste_telephone field
+				customers_with_phones = frappe.get_all(
+					"Customer",
+					fields=["name", "custom_liste_telephone"],
+					filters={"custom_liste_telephone": ["is", "set"]}
+				)
+				
+				# Check each customer's phone list for matches
+				for customer_record in customers_with_phones:
+					if not customer_record.custom_liste_telephone:
+						continue
+					
+					# Normalize all phones from the customer record
+					normalized_customer_phones = traiter_numero_tel(customer_record.custom_liste_telephone)
+					# Check if any phone matches
+					for order_phone in normalized_phones_from_order:
+						if order_phone in normalized_customer_phones:
+							existing_customer = customer_record.name
+							frappe.logger().info(
+								f"Found existing customer {existing_customer} via phone number {order_phone}"
+							)
+							break
+					
+					if existing_customer:
+						break
 
 		if not existing_customer:
 			# Create Customer
@@ -589,7 +624,7 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		else:
 			# Edit Customer
 			customer = frappe.get_doc("Customer", existing_customer)
-
+		
 		customer.customer_name = company_name if company_name else individual_name
 		customer.woocommerce_identifier = customer_identifier
 
@@ -1202,3 +1237,60 @@ def get_contacts_linking_to(doctype, docname, fields=None):
 			c["phone_nos"] = ph_by_parent.get(c["name"], [])
 
 	return contacts
+
+def normaliser_numero(telephone_raw):
+    """Nettoie un numéro et renvoie 0, 1 ou 2 numéros (8 chiffres) possibles."""
+    tel = (telephone_raw or "").replace(" ", "").replace("-", "").replace("(", "").replace(")", "").replace(".", "")
+    if not tel:
+        return []
+
+    nums = []
+
+    # Gérer les préfixes internationaux uniquement si len > 8
+    if len(tel) > 8:
+        if tel.startswith("+216"):
+            tel = tel[4:]
+        elif tel.startswith("00216"):
+            tel = tel[5:]
+        elif tel.startswith("216"):
+            tel = tel[3:]
+
+    if len(tel) == 8:
+        nums.append(tel)
+    elif len(tel) == 16:
+        # Cas où deux numéros sont concaténés
+        nums.append(tel[:8])
+        nums.append(tel[8:])
+
+    return nums
+
+
+def is_mobile_tunisien(num):
+    """Mobiles tunisiens classiques : 2,4,5,9."""
+    return len(num) == 8 and num[0] in ("2", "4", "5", "9")
+
+
+def traiter_numero_tel(champ_tel):
+    """
+    Prend custom_liste_telephone (multi-ligne),
+    renvoie la liste de numéros mobiles valides (8 chiffres).
+    """
+    tel_to_send = []
+
+    for raw in (champ_tel or "").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        for num in normaliser_numero(raw):
+            if is_mobile_tunisien(num):
+                tel_to_send.append(num)
+
+    # dédoublonnage
+    seen = set()
+    unique = []
+    for n in tel_to_send:
+        if n not in seen:
+            seen.add(n)
+            unique.append(n)
+
+    return unique

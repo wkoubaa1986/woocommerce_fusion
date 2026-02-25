@@ -28,7 +28,8 @@ app_license = "GNU GPLv3"
 
 # include js in doctype views
 doctype_js = {"Sales Order": "public/js/selling/sales_order.js", "Item": "public/js/stock/item.js"}
-doctype_list_js = {"Sales Order": "public/js/selling/sales_order_list.js"}
+doctype_list_js = {"Sales Order": "public/js/selling/sales_order_list.js",
+                   "Item": "public/js/stock/item_list.js"}
 # doctype_tree_js = {"doctype" : "public/js/doctype_tree.js"}
 # doctype_calendar_js = {"doctype" : "public/js/doctype_calendar.js"}
 
@@ -147,17 +148,26 @@ scheduler_events = {
 	# 		"woocommerce_fusion.tasks.daily"
 	# 	],
     "cron": {
+        # Synchronisation des commandes WooCommerce toutes les 5 minutes
         "*/5 * * * *": [
             "woocommerce_fusion.tasks.sync_sales_orders.sync_woocommerce_orders_modified_since"
+        ],
+        # Synchronisation des articles modifiés tous les jours SAUF le samedi à 2h du matin
+        "0 2 * * 0-5": [
+            "woocommerce_fusion.tasks.sync_job.cron_daily_sync_modified_items"
+        ],
+        # Synchronisation de TOUS les articles actifs le samedi à minuit
+        "0 0 * * 6": [
+            "woocommerce_fusion.tasks.sync_job.cron_weekly_sync_all_items"
         ]
     },
-	"hourly_long": [
-		"woocommerce_fusion.tasks.sync_items.sync_woocommerce_products_modified_since"
-	],
-	"daily_long": [
-		"woocommerce_fusion.tasks.stock_update.update_stock_levels_for_all_enabled_items_in_background",
-		"woocommerce_fusion.tasks.sync_item_prices.run_item_price_sync_in_background",
-	],
+	# "hourly_long": [
+	# 	"woocommerce_fusion.tasks.sync_items.sync_woocommerce_products_modified_since"
+	# ],
+	# "daily_long": [
+	# 	"woocommerce_fusion.tasks.stock_update.update_stock_levels_for_all_enabled_items_in_background",
+	# 	"woocommerce_fusion.tasks.sync_item_prices.run_item_price_sync_in_background",
+	# ],
 	# 	"monthly": [
 	# 		"woocommerce_fusion.tasks.monthly"
 	# 	],
