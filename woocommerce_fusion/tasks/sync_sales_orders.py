@@ -200,9 +200,22 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 			# create missing order in WooCommerce
 			pass
 		elif self.woocommerce_order and not self.sales_order:
+			# Do not recreate Sales Orders for terminal WC statuses — these were intentionally
+			# deleted or never worth importing (cancelled, trashed, failed, refunded).
+			_SKIP_CREATE_STATUSES = {"cancelled", "trash", "failed", "refunded"}
+			if self.woocommerce_order.status in _SKIP_CREATE_STATUSES:
+				return
 			# create missing order in ERPNext
 			self.create_sales_order(self.woocommerce_order)
 		elif self.sales_order and self.woocommerce_order:
+			# If the Sales Order is cancelled, always push cancellation to WooCommerce
+			# regardless of timestamps (WC returns local time, ERPNext stores UTC — naive
+			# comparison would always make WC appear newer and block the push).
+			if self.sales_order.docstatus == 2:
+				if self.woocommerce_order.status != "cancelled":
+					self.update_woocommerce_order(self.woocommerce_order, self.sales_order)
+				return
+
 			# both exist, check sync hash
 			if (
 				self.woocommerce_order.woocommerce_date_modified
@@ -528,13 +541,20 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		self.set_fee_lines_in_sales_order(new_sales_order, wc_order)
 		new_sales_order.flags.ignore_mandatory = True
 		new_sales_order.flags.created_by_sync = True
-		new_sales_order.insert()
-		if wc_server.submit_sales_orders:
-			new_sales_order.submit()
 
-		new_sales_order.reload()
-		self.create_and_link_payment_entry(wc_order, new_sales_order)
-		new_sales_order.save()
+		# Temporarily suppress ERPNext's "party disabled" check so syncing an order
+		# for a disabled customer does not raise PartyDisabled during SO creation.
+		frappe.flags.ignore_party_validation = True
+		try:
+			new_sales_order.insert()
+			if wc_server.submit_sales_orders:
+				new_sales_order.submit()
+
+			new_sales_order.reload()
+			self.create_and_link_payment_entry(wc_order, new_sales_order)
+			new_sales_order.save()
+		finally:
+			frappe.flags.ignore_party_validation = False
 
 	def create_or_link_customer_and_address(self, wc_order: WooCommerceOrder) -> str:
 		"""

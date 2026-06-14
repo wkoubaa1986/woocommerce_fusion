@@ -48,9 +48,6 @@ class WooCommerceServer(Document):
 		erpnext_so_statuses = [map.erpnext_sales_order_status for map in self.sales_order_status_map]
 		if len(erpnext_so_statuses) != len(set(erpnext_so_statuses)):
 			frappe.throw(_("Duplicate ERPNext Sales Order Statuses found in Sales Order Status Map"))
-		wc_so_statuses = [map.woocommerce_sales_order_status for map in self.sales_order_status_map]
-		if len(wc_so_statuses) != len(set(wc_so_statuses)):
-			frappe.throw(_("Duplicate WooCommerce Sales Order Statuses found in Sales Order Status Map"))
 
 	def validate_item_map(self):
 		"""

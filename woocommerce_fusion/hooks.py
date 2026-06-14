@@ -141,12 +141,6 @@ doc_events = {
 # ---------------
 
 scheduler_events = {
-	# 	"all": [
-	# 		"woocommerce_fusion.tasks.all"
-	# 	],
-	# 	"weekly": [
-	# 		"woocommerce_fusion.tasks.daily"
-	# 	],
     "cron": {
         # Synchronisation des commandes WooCommerce toutes les 5 minutes
         "*/5 * * * *": [
@@ -161,16 +155,13 @@ scheduler_events = {
             "woocommerce_fusion.tasks.sync_job.cron_weekly_sync_all_items"
         ]
     },
-	# "hourly_long": [
-	# 	"woocommerce_fusion.tasks.sync_items.sync_woocommerce_products_modified_since"
-	# ],
-	# "daily_long": [
-	# 	"woocommerce_fusion.tasks.stock_update.update_stock_levels_for_all_enabled_items_in_background",
-	# 	"woocommerce_fusion.tasks.sync_item_prices.run_item_price_sync_in_background",
-	# ],
-	# 	"monthly": [
-	# 		"woocommerce_fusion.tasks.monthly"
-	# 	],
+    # "hourly_long": [
+    # 	"woocommerce_fusion.tasks.sync_items.sync_woocommerce_products_modified_since"
+    # ],
+    # "daily_long": [
+    # 	"woocommerce_fusion.tasks.stock_update.update_stock_levels_for_all_enabled_items_in_background",
+    # 	"woocommerce_fusion.tasks.sync_item_prices.run_item_price_sync_in_background",
+    # ],
 }
 
 # Testing
@@ -245,6 +236,10 @@ ignore_links_on_delete = [
 
 
 fixtures = [
+	{
+		"dt": "WooCommerce Server",
+		"filters": [["name", "=", "aquaworldservicing.com"]],
+	},
 	{
 		"dt": "Custom Field",
 		"filters": [

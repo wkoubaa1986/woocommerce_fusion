@@ -43,6 +43,21 @@ class CustomSalesOrder(SalesOrder):
 			naming_series = get_default_naming_series("Sales Order")
 			self.name = make_autoname(key=naming_series)
 
+	def on_trash(self):
+		"""
+		Block deletion of WooCommerce-linked Sales Orders that are still in Draft (docstatus=0).
+		Users must submit then cancel the order so the cancellation is synced back to WooCommerce.
+		Cancelled orders (docstatus=2) are allowed to be deleted.
+		"""
+		if self.woocommerce_id and self.woocommerce_server and self.docstatus == 0:
+			frappe.throw(
+				_(
+					"La commande {0} est liée à la commande WooCommerce #{1} et ne peut pas être supprimée directement. "
+					"Veuillez valider la commande puis l'annuler afin que le statut soit correctement synchronisé avec WooCommerce."
+				).format(self.name, self.woocommerce_id),
+				title=_("Suppression bloquée"),
+			)
+
 	def on_change(self):
 		"""
 		This is called when a document's values has been changed (including db_set).
