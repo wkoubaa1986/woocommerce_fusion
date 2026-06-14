@@ -4,7 +4,6 @@
 import json
 from dataclasses import dataclass
 from typing import Dict
-import pdb
 from woocommerce_fusion.woocommerce.woocommerce_api import WooCommerceAPI, WooCommerceResource
 
 

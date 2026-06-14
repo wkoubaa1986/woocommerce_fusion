@@ -2,7 +2,6 @@ from datetime import datetime
 from time import sleep
 from typing import Dict, List, Optional, Any
 import json
-import pdb
 import frappe
 from frappe.utils import getdate, nowdate, flt
 
@@ -16,7 +15,7 @@ from woocommerce_fusion.woocommerce.woocommerce_api import (
 )
 
 
-_VERIFY_TLS = False
+_VERIFY_TLS = None
 
 def get_verify_tls() -> bool:
     """Lit le setting uniquement quand Frappe est initialisé (runtime)."""

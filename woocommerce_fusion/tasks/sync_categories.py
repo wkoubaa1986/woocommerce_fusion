@@ -9,10 +9,9 @@ from woocommerce_fusion.tasks.utils import APIWithRequestLogging
 from woocommerce_fusion.integrations.wp_media import upload_media_from_url, _make_absolute_public_file_url, _guess_filename_from_path, attach_media_to_wc_category
 from woocommerce_fusion.integrations.content_enrichment import generate_item_group_seo_minimal
 
-import pdb
-import requests  # add this
+import requests
 
-_VERIFY_TLS = False
+_VERIFY_TLS = None
 
 def get_verify_tls() -> bool:
     """Lit le setting uniquement quand Frappe est initialisé (runtime)."""

@@ -7,12 +7,22 @@ from frappe import _
 from time import sleep
 import requests
 from requests.auth import HTTPBasicAuth
-import pdb
 import re, unicodedata
 from woocommerce_fusion.tasks.sync import SynchroniseWooCommerce
 from woocommerce_fusion.woocommerce.doctype.woocommerce_server.woocommerce_server import WooCommerceServer
 from woocommerce_fusion.integrations.content_enrichment import generate_brand_seo_minimal
 from woocommerce_fusion.tasks.utils import APIWithRequestLogging
+
+TIMEOUT = 40  # seconds
+_VERIFY_TLS = None
+
+
+def get_verify_tls() -> bool:
+    global _VERIFY_TLS
+    if _VERIFY_TLS is None:
+        v = frappe.db.get_single_value("WooCommerce Fusion Settings", "verify_ssl_certificates")
+        _VERIFY_TLS = True if v is None else bool(v)
+    return _VERIFY_TLS
 
 
 def _slugify(s: str) -> str:
@@ -200,7 +210,8 @@ class SynchroniseBrandsAttributes(SynchroniseWooCommerce):
                 json=data, 
                 auth=auth, 
                 headers=headers, 
-                verify=self.wp_config.verify_ssl
+                verify=self.wp_config.verify_ssl,
+                timeout=TIMEOUT,
             )
         elif method.upper() == "PUT":
             response = requests.put(
@@ -208,24 +219,38 @@ class SynchroniseBrandsAttributes(SynchroniseWooCommerce):
                 json=data, 
                 auth=auth, 
                 headers=headers, 
-                verify=self.wp_config.verify_ssl
+                verify=self.wp_config.verify_ssl,
+                timeout=TIMEOUT,
             )
         elif method.upper() == "GET":
             response = requests.get(
                 url, 
                 auth=auth, 
                 headers=headers, 
-                verify=self.wp_config.verify_ssl
+                verify=self.wp_config.verify_ssl,
+                timeout=TIMEOUT,
             )
         else:
-            frappe.throw(f"Unsupported HTTP method: {method}")
-        
-        # Check for errors
-        if response.status_code not in [200, 201]:
-            error_data = response.json() if response.content else {}
-            error_msg = error_data.get("message", response.text)
-            frappe.throw(f"WordPress API Error ({response.status_code}): {error_msg}")
-        
+            frappe.throw(_("Unsupported HTTP method: {0}").format(method))
+
+        # Check for errors — differentiated by status code
+        status = response.status_code
+        if status in (200, 201):
+            return response.json()
+        if status == 401:
+            frappe.throw(_("WordPress authentication failed (401). Check credentials in WooCommerce Fusion Settings."))
+        if status == 403:
+            frappe.throw(_("WordPress permission denied (403). Check REST API permissions for this user."))
+        if status == 404:
+            frappe.throw(_("WordPress resource not found (404): {0}").format(url))
+        if status == 429:
+            frappe.throw(_("WordPress rate limit exceeded (429). Retry later or reduce sync frequency."))
+        if status >= 500:
+            frappe.throw(_("WordPress server error ({0}). Check WordPress error logs.").format(status))
+        # Fallback for other 4xx
+        error_msg = (response.json().get("message", "") if response.content else "") or response.text[:200]
+        frappe.throw(_("WordPress API error ({0}): {1}").format(status, error_msg))
+
         return response.json()
 
     # ==================== ATTRIBUTES ====================
@@ -446,7 +471,7 @@ def sync_attribute(attribute_name: str, woocommerce_server: str = None):
         consumer_secret=server.api_consumer_secret,
         version="wc/v3",
         timeout=40,
-        verify_ssl=False,
+        verify_ssl=get_verify_tls(),
     )
 
     attr_id, attr_term_id = sync._sync_udm_attribute(attribute_name)

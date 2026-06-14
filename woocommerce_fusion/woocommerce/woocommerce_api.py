@@ -2,7 +2,6 @@ import json
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
-import pdb
 import frappe
 from frappe import _
 from frappe.model.document import Document

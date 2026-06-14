@@ -1174,7 +1174,6 @@ import frappe
 from frappe.utils.file_manager import get_file
 import io
 from PIL import Image, ImageOps
-import pdb
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
 

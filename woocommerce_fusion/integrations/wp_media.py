@@ -12,12 +12,16 @@ from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urlsplit, urlunsplit, quote
 
+import ipaddress
+
 import frappe
 import requests
+import urllib3
 from frappe import _
-import pdb
 import mimetypes
+
 TIMEOUT = 40  # seconds
+MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024  # 50 MB hard cap
 
 
 # -------------------------------
@@ -45,7 +49,7 @@ def _get_wp_config() -> WPConfig:
             if s.get("verify_ssl_certificates") is not None:
                 verify_ssl = bool(s.get("verify_ssl_certificates"))
     except Exception:
-        pass
+        frappe.log_error("WooCommerce Fusion: failed to read WP config", frappe.get_traceback())
 
     if not (base_url and username and app_pw):
         frappe.throw(
@@ -60,6 +64,11 @@ def _new_wp_session(cfg: WPConfig) -> requests.Session:
     sess = requests.Session()
     sess.auth = (cfg.username, cfg.app_password)
     sess.verify = cfg.verify_ssl
+    if not cfg.verify_ssl:
+        frappe.logger().warning(
+            "WordPress session: SSL certificate verification is DISABLED. Vulnerable to MITM."
+        )
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     return sess
 
 
@@ -81,6 +90,22 @@ def _make_absolute_public_file_url(image_path: str) -> str:
     path = image_path if image_path.startswith("/") else f"/{image_path}"
     encoded_path = quote(path, safe="/")
     return f"{base}{encoded_path}"
+
+
+def _validate_fetch_url(url: str) -> None:
+    """Reject URLs that could cause SSRF (private/loopback IPs, non-http schemes)."""
+    parsed = urlsplit(url)
+    if parsed.scheme not in ("http", "https"):
+        frappe.throw(_("Image URL scheme '{0}' is not allowed.").format(parsed.scheme))
+    host = parsed.hostname or ""
+    if host.lower() in ("localhost", "::1"):
+        frappe.throw(_("Image URL points to a disallowed host: {0}").format(host))
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            frappe.throw(_("Image URL points to a disallowed IP address: {0}").format(host))
+    except ValueError:
+        pass  # hostname — DNS resolution not checked here
 
 
 # -------------------------------
@@ -118,9 +143,10 @@ def delete_media_by_ids(media_ids: dict) -> dict:
                 timeout=TIMEOUT
             )
             
-            if resp.status_code == 200:
+            if resp.status_code in (200, 404):
                 results["deleted"].append(media_id)
-                frappe.logger().info(f"Deleted WordPress media ID {media_id}")
+                action = "Deleted" if resp.status_code == 200 else "Already absent"
+                frappe.logger().info(f"{action}: WordPress media ID {media_id}")
             else:
                 results["failed"].append({
                     "id": media_id, 
@@ -143,6 +169,7 @@ def upload_media_from_url(image_url: str, filename: Optional[str] = None, alt_te
     Returns the media JSON with id + link.
     """
     
+    _validate_fetch_url(image_url)
     cfg = _get_wp_config()
     sess = _new_wp_session(cfg)
     if not filename:
@@ -151,15 +178,26 @@ def upload_media_from_url(image_url: str, filename: Optional[str] = None, alt_te
     try:
         resp = requests.get(image_url, stream=True, timeout=TIMEOUT)
         resp.raise_for_status()
-        file_bytes = resp.content
+        chunks, total = [], 0
+        for chunk in resp.iter_content(65536):
+            total += len(chunk)
+            if total > MAX_DOWNLOAD_BYTES:
+                frappe.throw(
+                    _("Image exceeds maximum allowed size of {0} MB.").format(MAX_DOWNLOAD_BYTES // (1024 * 1024))
+                )
+            chunks.append(chunk)
+        file_bytes = b"".join(chunks)
+    except frappe.exceptions.ValidationError:
+        raise
     except Exception as e:
         _log_and_throw("Failed to download ERPNext image", exception=e)
 
     media_endpoint = f"{cfg.base_url}/wp-json/wp/v2/media"
     mime = mimetypes.guess_type(filename)[0] or "image/jpeg"
+    safe_filename = filename.encode("ascii", "ignore").decode("ascii")
     headers = {
         "Content-Type": mime,
-        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Content-Disposition": f'attachment; filename="{safe_filename}"',
         "Accept": "application/json",
     }
 
@@ -301,4 +339,4 @@ def _log_and_throw(msg: str, exception: Exception | None = None, response: reque
 
     log = frappe.log_error(title="WordPress Media Error", message=f"{msg}\n\n{detail}")
     link = frappe.utils.get_link_to_form("Error Log", log.name)
-    frappe.throw(_("{0}. details :{1} See Error Log {2}.").format(msg, detail ,link))
+    frappe.throw(_("{0}. See Error Log {1}.").format(msg, link))

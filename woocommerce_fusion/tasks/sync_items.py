@@ -31,8 +31,6 @@ from woocommerce_fusion.integrations import wp_media
 from woocommerce_fusion.integrations.content_enrichment import generate_website_contenant, classify_item_group, retouch_item_images, classify_item_collections, treat_left_item_images
 from woocommerce_fusion.integrations.item_images_treatment import dedupe_item_images
 
-
-import pdb
 from typing import List
 import mimetypes
 import posixpath
@@ -55,7 +53,7 @@ def _get_shipping_class_slug(item) -> str:
     if weight >= 20:
         return "lourd"
     return ""  # no class
-_VERIFY_TLS = False
+_VERIFY_TLS = None
 
 def get_verify_tls() -> bool:
     """Lit le setting uniquement quand Frappe est initialisé (runtime)."""
