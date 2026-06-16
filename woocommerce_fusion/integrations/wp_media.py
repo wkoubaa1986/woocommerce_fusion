@@ -108,6 +108,62 @@ def _validate_fetch_url(url: str) -> None:
         pass  # hostname — DNS resolution not checked here
 
 
+def _fetch_image_bytes(image_url: str) -> bytes:
+    """
+    Return the raw bytes for an image.
+
+    ERPNext-hosted files (/files/… and /private/files/…) are read directly
+    from disk — this avoids HTTP entirely, so it works even when the file is
+    private (403 over HTTP) or the dev site is served on localhost (rejected
+    by the SSRF guard).  Only genuinely external URLs are downloaded via HTTP.
+    """
+    from urllib.parse import unquote
+
+    parsed = urlsplit(image_url)
+    url_path = unquote(parsed.path)  # e.g. /files/foo.jpg or /private/files/foo.jpg
+
+    disk_path = allowed_root = None
+    if url_path.startswith("/private/files/"):
+        allowed_root = os.path.realpath(frappe.get_site_path("private", "files"))
+        disk_path = os.path.realpath(
+            os.path.join(frappe.get_site_path("private", "files"), url_path[len("/private/files/"):])
+        )
+    elif url_path.startswith("/files/"):
+        allowed_root = os.path.realpath(frappe.get_site_path("public", "files"))
+        disk_path = os.path.realpath(
+            os.path.join(frappe.get_site_path("public", "files"), url_path[len("/files/"):])
+        )
+
+    if disk_path is not None:
+        # Guard against path traversal: stay inside the allowed root.
+        if not (disk_path == allowed_root or disk_path.startswith(allowed_root + os.sep)):
+            frappe.throw(_("Access to file path is not allowed."))
+        if not os.path.isfile(disk_path):
+            # Plain exception (no user popup): callers catch this and skip the image.
+            raise FileNotFoundError(f"File not found on disk: {url_path}")
+        with open(disk_path, "rb") as fh:
+            data = fh.read()
+        if len(data) > MAX_DOWNLOAD_BYTES:
+            frappe.throw(
+                _("Image exceeds maximum allowed size of {0} MB.").format(MAX_DOWNLOAD_BYTES // (1024 * 1024))
+            )
+        return data
+
+    # External URL — download via HTTP (with SSRF guard).
+    _validate_fetch_url(image_url)
+    resp = requests.get(image_url, stream=True, timeout=TIMEOUT)
+    resp.raise_for_status()
+    chunks, total = [], 0
+    for chunk in resp.iter_content(65536):
+        total += len(chunk)
+        if total > MAX_DOWNLOAD_BYTES:
+            frappe.throw(
+                _("Image exceeds maximum allowed size of {0} MB.").format(MAX_DOWNLOAD_BYTES // (1024 * 1024))
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 # -------------------------------
 # Upload to WordPress
 # -------------------------------
@@ -165,28 +221,17 @@ def delete_media_by_ids(media_ids: dict) -> dict:
 
 def upload_media_from_url(image_url: str, filename: Optional[str] = None, alt_text: Optional[str] = None) -> dict:
     """
-    Upload a public image URL to WordPress Media Library.
-    Returns the media JSON with id + link.
+    Upload an ERPNext image to WordPress Media Library.
+    Private files (/private/files/…) are read from disk; public files are
+    fetched via HTTP.  Returns the media JSON with id + link.
     """
-    
-    _validate_fetch_url(image_url)
     cfg = _get_wp_config()
     sess = _new_wp_session(cfg)
     if not filename:
         filename = _guess_filename_from_path(image_url)
 
     try:
-        resp = requests.get(image_url, stream=True, timeout=TIMEOUT)
-        resp.raise_for_status()
-        chunks, total = [], 0
-        for chunk in resp.iter_content(65536):
-            total += len(chunk)
-            if total > MAX_DOWNLOAD_BYTES:
-                frappe.throw(
-                    _("Image exceeds maximum allowed size of {0} MB.").format(MAX_DOWNLOAD_BYTES // (1024 * 1024))
-                )
-            chunks.append(chunk)
-        file_bytes = b"".join(chunks)
+        file_bytes = _fetch_image_bytes(image_url)
     except frappe.exceptions.ValidationError:
         raise
     except Exception as e:

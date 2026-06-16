@@ -6,7 +6,7 @@ import frappe
 import hashlib
 import json
 from woocommerce_fusion.tasks.utils import APIWithRequestLogging
-from woocommerce_fusion.integrations.wp_media import upload_media_from_url, _make_absolute_public_file_url, _guess_filename_from_path, attach_media_to_wc_category
+from woocommerce_fusion.integrations.wp_media import upload_media_from_url, _make_absolute_public_file_url, _guess_filename_from_path, attach_media_to_wc_category, _fetch_image_bytes
 from woocommerce_fusion.integrations.content_enrichment import generate_item_group_seo_minimal
 
 import requests
@@ -22,14 +22,12 @@ def get_verify_tls() -> bool:
         _VERIFY_TLS = True if v is None else bool(v)
     return _VERIFY_TLS
 def _sha1_of_remote(url: str, chunk: int = 65536) -> str | None:
-    """Stream remote file and return SHA1 hex; None on failure."""
+    """Return SHA1 hex of a remote or local-private ERPNext file; None on failure."""
     try:
+        data = _fetch_image_bytes(url)
         h = hashlib.sha1()
-        with requests.get(url, stream=True, timeout=60, verify=get_verify_tls()) as r:
-            r.raise_for_status()
-            for part in r.iter_content(chunk_size=chunk):
-                if part:
-                    h.update(part)
+        for i in range(0, len(data), chunk):
+            h.update(data[i : i + chunk])
         return h.hexdigest()
     except Exception:
         frappe.log_error("Hashing remote image failed", frappe.get_traceback())
