@@ -236,10 +236,10 @@ ignore_links_on_delete = [
 
 
 fixtures = [
-	{
-		"dt": "WooCommerce Server",
-		"filters": [["name", "=", "aquaworldservicing.com"]],
-	},
+	# NOTE: "WooCommerce Server" n'est PAS un fixture : c'est une config par
+	# environnement (URL + clés API/secret). L'exporter cassait le `migrate` en prod
+	# (URL absente -> ValidationError) et aurait écrasé la config live + exposé des
+	# secrets dans git. La config vit dans la base de chaque environnement.
 	{
 		"dt": "Custom Field",
 		"filters": [
