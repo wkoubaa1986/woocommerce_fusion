@@ -8,12 +8,14 @@ from woocommerce_fusion.tasks.utils import APIWithRequestLogging
 def update_stock_levels_for_woocommerce_item(doc, method):
 	if not frappe.flags.in_test:
 		if doc.doctype in ("Stock Entry", "Stock Reconciliation", "Sales Invoice", "Delivery Note"):
-			# Check if there are any enabled WooCommerce Servers with stock sync enabled
+			# Check if there are any enabled WooCommerce Servers with stock sync enabled.
+			# Use frappe.db.count (no permission check): this is a system-level config
+			# check and must not depend on the submitting user's read access to
+			# "WooCommerce Server" (otherwise low-permission users get a PermissionError
+			# when submitting Delivery Notes / Sales Invoices).
 			if (
-				len(
-					frappe.get_list(
-						"WooCommerce Server", filters={"enable_sync": 1, "enable_stock_level_synchronisation": 1}
-					)
+				frappe.db.count(
+					"WooCommerce Server", {"enable_sync": 1, "enable_stock_level_synchronisation": 1}
 				)
 				> 0
 			):
