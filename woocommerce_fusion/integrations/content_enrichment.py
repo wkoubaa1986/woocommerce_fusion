@@ -2305,9 +2305,23 @@ def _gemini_edit_image_bytes(client: genai.Client, img_bytes: bytes) -> bytes:
                     out_im = Image.open(io.BytesIO(raw))
                     return _pil_to_webp_square_bytes(out_im, size=(2000, 2000), quality=88)
 
-        # fallback local
+        # No image returned (refusal, safety block, text-only model...). Log why
+        # instead of silently returning the padded original.
+        finish = [getattr(c, "finish_reason", None) for c in (getattr(resp, "candidates", []) or [])]
+        texts = []
+        for cand in getattr(resp, "candidates", []) or []:
+            content = getattr(cand, "content", None)
+            for part in (getattr(content, "parts", None) or []):
+                if getattr(part, "text", None):
+                    texts.append(part.text)
+        frappe.log_error(
+            f"finish_reason={finish}\nprompt_feedback={getattr(resp, 'prompt_feedback', None)}\n"
+            f"text={' | '.join(texts)[:1000]}",
+            "gemini image edit: no image returned",
+        )
         return _pil_to_webp_square_bytes(base_im, size=(2000, 2000), quality=88)
     except Exception:
+        frappe.log_error(frappe.get_traceback(), "gemini image edit failed")
         return _pil_to_webp_square_bytes(base_im, size=(2000, 2000), quality=88)
 
 
