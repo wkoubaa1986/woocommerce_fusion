@@ -565,7 +565,29 @@ def get_wc_parameters_from_filters(filters):
 			continue
 		frappe.throw(f"Unsupported filter '{filter[2]}' for field '{filter[1]}'")
 
+	# Les dates construites ci-dessus sont en heure SYSTÈME ERPNext ; sans
+	# dates_are_gmt, WooCommerce les interprète dans le fuseau du site WordPress
+	# (UTC+2 vs Tunis UTC+1 constaté en prod) : re-fetchs parasites dans un sens,
+	# commandes PERDUES si l'écart s'inverse. On convertit tout en GMT et on le
+	# déclare explicitement.
+	champs_dates = [c for c in ("modified_after", "modified_before", "after", "before") if c in params]
+	if champs_dates:
+		for c in champs_dates:
+			params[c] = _to_gmt_iso(params[c])
+		params["dates_are_gmt"] = "true"
+
 	return params
+
+
+def _to_gmt_iso(valeur):
+	"""Heure système ERPNext → ISO8601 GMT, format attendu par l'API WooCommerce."""
+	from zoneinfo import ZoneInfo
+
+	from frappe.utils import get_system_timezone
+
+	dt = get_datetime(valeur)
+	dt = dt.replace(tzinfo=ZoneInfo(get_system_timezone())).astimezone(ZoneInfo("UTC"))
+	return dt.strftime("%Y-%m-%dT%H:%M:%S")
 
 
 def log_and_raise_error(exception=None, error_text=None, response=None):

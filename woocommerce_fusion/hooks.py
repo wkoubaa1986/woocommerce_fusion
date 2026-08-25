@@ -153,6 +153,20 @@ scheduler_events = {
         # Synchronisation de TOUS les articles actifs le samedi à minuit
         "0 0 * * 6": [
             "woocommerce_fusion.tasks.sync_job.cron_weekly_sync_all_items"
+        ],
+        # Prix : passe complète chaque nuit — la synchro articles ne pousse
+        # jamais regular_price sur un produit existant, et le hook Item Price
+        # seul laisse les variantes/prix historiques en rade. Diff-aware :
+        # quasi aucune écriture quand rien n'a changé.
+        "45 1 * * *": [
+            "woocommerce_fusion.tasks.sync_item_prices.run_item_price_sync_in_background"
+        ],
+        # Filet de rattrapage : toute commande Woo récente absente d'ERPNext est
+        # resynchronisée (sauf statut terminal ou suppression volontaire — la
+        # corbeille Deleted Document fait foi). Le flux 5 min avance son curseur
+        # même quand un job échoue ; ce filet est la garantie de non-perte.
+        "0 3 * * *": [
+            "woocommerce_fusion.tasks.sync_sales_orders.reconcile_missing_woocommerce_orders"
         ]
     },
     # "hourly_long": [

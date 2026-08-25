@@ -7,7 +7,7 @@ from erpnext.selling.doctype.sales_order.sales_order import SalesOrder
 from erpnext.selling.doctype.sales_order_item.sales_order_item import SalesOrderItem
 from frappe import _
 from frappe.utils import get_datetime
-from frappe.utils.data import cstr, now
+from frappe.utils.data import add_to_date, cstr, now
 from jsonpath_ng.ext import parse
 
 from woocommerce_fusion.exceptions import SyncDisabledError, WooCommerceOrderNotFoundError
@@ -57,10 +57,14 @@ def run_sales_order_sync(
 			)
 			woocommerce_order.load_from_db()
 
-		# Trigger sync
+		# Trigger sync. job_id + deduplicate : la même commande refetchée avant
+		# que son job ne tourne ne doit pas produire deux jobs concurrents
+		# (source des TimestampMismatchError).
 		sync = SynchroniseSalesOrder(woocommerce_order=woocommerce_order)
 		if enqueue:
-			frappe.enqueue(sync.run)
+			frappe.enqueue(sync.run,
+			               job_id=f"wc_order_sync::{woocommerce_order.name}",
+			               deduplicate=True)
 		else:
 			sync.run()
 
@@ -72,7 +76,9 @@ def run_sales_order_sync(
 		# Trigger sync for every linked server
 		sync = SynchroniseSalesOrder(sales_order=sales_order)
 		if enqueue:
-			frappe.enqueue(sync.run)
+			frappe.enqueue(sync.run,
+			               job_id=f"wc_order_sync::{sales_order.name}",
+			               deduplicate=True)
 		else:
 			sync.run()
 
@@ -80,6 +86,63 @@ def run_sales_order_sync(
 		sync.sales_order if sync else None,
 		sync.woocommerce_order if sync else None,
 	)
+
+# Statuts Woo terminaux : jamais de création de commande ERPNext pour eux —
+# annulées, corbeille, échouées, remboursées (partagé avec la réconciliation).
+SKIP_CREATE_STATUSES = {"cancelled", "trash", "failed", "refunded"}
+
+
+def reconcile_missing_woocommerce_orders(jours: int = 7):
+	"""Filet de sécurité quotidien : toute commande Woo récente ABSENTE
+	d'ERPNext est resynchronisée.
+
+	Le flux normal avance son curseur même quand un job de création échoue :
+	sans ce filet, une commande dont la création plante pour une cause nouvelle
+	serait reperdue en silence (7 commandes perdues avant le 25/08/2026).
+
+	NE RECRÉE JAMAIS une commande supprimée volontairement : le nom déterministe
+	(WEB{idx}-{id:06d}) est cherché dans Deleted Document — l'utilisateur annule
+	puis SUPPRIME ses commandes web, cette suppression doit être respectée.
+	"""
+	depuis = add_to_date(now(), days=-jours)
+	for wc_order in get_list_of_wc_orders(date_time_from=depuis):
+		try:
+			if wc_order.status in SKIP_CREATE_STATUSES:
+				continue
+			if frappe.db.exists("Sales Order", {
+				"woocommerce_id": wc_order.id,
+				"woocommerce_server": wc_order.woocommerce_server,
+			}):
+				continue
+			nom = _nom_deterministe_commande(wc_order)
+			if nom and frappe.db.exists("Deleted Document", {
+				"deleted_doctype": "Sales Order", "deleted_name": nom,
+			}):
+				continue  # supprimée volontairement d'ERPNext
+			run_sales_order_sync(woocommerce_order=wc_order, enqueue=True)
+			# Trace visible : un rattrapage doit se voir, il signale un raté du flux normal.
+			frappe.log_error("WooCommerce Reconciliation",
+			                 f"Commande Woo {wc_order.id} absente d'ERPNext — "
+			                 f"resynchronisation lancée (statut {wc_order.status}).")
+		except Exception:
+			frappe.log_error("WooCommerce Order Sync Error",
+			                 f"Réconciliation, commande {getattr(wc_order, 'id', '?')}:\n"
+			                 f"{frappe.get_traceback()}")
+
+
+def _nom_deterministe_commande(wc_order):
+	"""Réplique de CustomSalesOrder.autoname (WEB{idx}-{id:06d}) — None si le
+	serveur utilise une naming series (nom imprévisible)."""
+	wc_server = frappe.get_cached_doc("WooCommerce Server", wc_order.woocommerce_server)
+	if wc_server.sales_order_series:
+		return None
+	serveurs = sorted(frappe.get_all("WooCommerce Server", fields=["name", "creation"]),
+	                  key=lambda s: s.creation)
+	idx = next((i for i, s in enumerate(serveurs) if s["name"] == wc_order.woocommerce_server), None)
+	if idx is None:
+		return None
+	return "WEB{}-{:06}".format(idx + 1, int(wc_order.id))
+
 
 @frappe.whitelist()
 def sync_woocommerce_orders_modified_since(date_time_from=None):
@@ -101,17 +164,28 @@ def sync_woocommerce_orders_modified_since(date_time_from=None):
 		)
 		raise ValueError(error_text)
 
+	# Curseur capturé AVANT le fetch : tout ce qui est modifié pendant que la
+	# requête tourne sera revu au prochain passage au lieu d'être perdu.
+	# Recul de sécurité de 10 min : le re-traitement est idempotent et bon
+	# marché, un trou de fenêtre (fuseau, horloge) ne l'est pas.
+	new_cursor = add_to_date(now(), minutes=-10)
+
 	wc_orders = get_list_of_wc_orders(date_time_from=date_time_from)
 	wc_orders += get_list_of_wc_orders(date_time_from=date_time_from, status="trash")
-	
+
 	for wc_order in wc_orders:
 		try:
 			run_sales_order_sync(woocommerce_order=wc_order, enqueue=True)
-		# Skip orders with errors, as these exceptions will be logged
 		except Exception:
-			pass
+			# Ne JAMAIS avaler en silence : le curseur avance, une commande dont
+			# la mise en file échoue ici serait perdue sans trace (7 commandes
+			# perdues avant le 25/08/2026).
+			frappe.log_error(
+				"WooCommerce Order Sync Error",
+				f"Commande Woo {getattr(wc_order, 'id', wc_order)}:\n{frappe.get_traceback()}",
+			)
 
-	frappe.db.set_single_value("WooCommerce Integration Settings", "wc_last_sync_date", now())
+	frappe.db.set_single_value("WooCommerce Integration Settings", "wc_last_sync_date", new_cursor)
 
 
 class SynchroniseSalesOrder(SynchroniseWooCommerce):
@@ -202,8 +276,7 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		elif self.woocommerce_order and not self.sales_order:
 			# Do not recreate Sales Orders for terminal WC statuses — these were intentionally
 			# deleted or never worth importing (cancelled, trashed, failed, refunded).
-			_SKIP_CREATE_STATUSES = {"cancelled", "trash", "failed", "refunded"}
-			if self.woocommerce_order.status in _SKIP_CREATE_STATUSES:
+			if self.woocommerce_order.status in SKIP_CREATE_STATUSES:
 				return
 			# create missing order in ERPNext
 			self.create_sales_order(self.woocommerce_order)
@@ -249,7 +322,14 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 			so_dirty = False
 
 			# Update the woocommerce_status field if necessary
-			wc_order_status = WC_ORDER_STATUS_MAPPING_REVERSE[woocommerce_order.status]
+			# .get + repli : un statut Woo inconnu (plugin) ne doit pas faire un
+			# KeyError qui perd la commande — on garde le statut brut, loggé.
+			wc_order_status = WC_ORDER_STATUS_MAPPING_REVERSE.get(woocommerce_order.status)
+			if wc_order_status is None:
+				frappe.log_error("WooCommerce Order Sync Error",
+				                 f"Statut Woo inconnu {woocommerce_order.status!r} "
+				                 f"(commande {woocommerce_order.id})")
+				wc_order_status = woocommerce_order.status
 			if sales_order.woocommerce_status != wc_order_status:
 				sales_order.woocommerce_status = wc_order_status
 				so_dirty = True
@@ -503,7 +583,9 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		new_sales_order.po_no = new_sales_order.woocommerce_id = wc_order.id
 		new_sales_order.custom_woocommerce_customer_note = wc_order.customer_note
 
-		new_sales_order.woocommerce_status = WC_ORDER_STATUS_MAPPING_REVERSE[wc_order.status]
+		new_sales_order.woocommerce_status = (
+			WC_ORDER_STATUS_MAPPING_REVERSE.get(wc_order.status) or wc_order.status
+		)
 		wc_server = frappe.get_cached_doc("WooCommerce Server", wc_order.woocommerce_server)
 		new_sales_order.woocommerce_server = wc_order.woocommerce_server
 		# Set the payment_method_title field if necessary, use the payment method ID if the title field is too long
@@ -667,7 +749,10 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		self.create_or_update_address(wc_order)
 		contact = create_contact(raw_billing_data, self.customer)
 		self.customer.reload()
-		self.customer.customer_primary_contact = contact.name
+		# create_contact renvoie None quand la commande n'a ni e-mail ni
+		# téléphone : ne pas planter la création pour autant.
+		if contact:
+			self.customer.customer_primary_contact = contact.name
 		try:
 			self.customer.save()
 		except Exception:
@@ -722,6 +807,14 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 				).run(as_dict=True)
 
 				found_item = frappe.get_doc("Item", item_codes[0].parent) if item_codes else None
+
+			if not found_item:
+				# Message explicite plutôt qu'un AttributeError anonyme : l'article
+				# n'est pas lié (ou désactivé) côté ERPNext — c'est actionnable.
+				frappe.throw(_(
+					"Commande Woo {0} : l'article Woo id={1} (sku {2}) n'a pas de "
+					"lien Item WooCommerce Server actif côté ERPNext.").format(
+					wc_order.id, item.get("product_id"), item.get("sku")))
 
 			# If we are applying a Sales Taxes and Charges Template (as opposed to Actual Tax), then we need to
 			# determine if the item price should include tax or not
@@ -968,7 +1061,9 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		address.country = frappe.get_value("Country", {"code": raw_data.get("country", "IN").lower()})
 		address.state = raw_data.get("state")
 		address.pincode = raw_data.get("postcode")
-		address.phone = raw_data.get("phone")
+		# premier numéro normalisé si possible — le champ brut peut porter
+		# plusieurs numéros que le validateur refuserait
+		address.phone = (normaliser_numero(raw_data.get("phone")) or [raw_data.get("phone")])[0]
 		address.address_title = (
 			customer.customer_name
 			if title_convention == "Customer Name only"
@@ -995,7 +1090,9 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		address.country = frappe.get_value("Country", {"code": raw_data.get("country", "IN").lower()})
 		address.state = raw_data.get("state")
 		address.pincode = raw_data.get("postcode")
-		address.phone = raw_data.get("phone")
+		# premier numéro normalisé si possible — le champ brut peut porter
+		# plusieurs numéros que le validateur refuserait
+		address.phone = (normaliser_numero(raw_data.get("phone")) or [raw_data.get("phone")])[0]
 		address.address_title = (
 			{customer.customer_name}
 			if title_convention == "Customer Name only"
@@ -1044,7 +1141,7 @@ def get_list_of_wc_orders(
 	while new_results:
 		woocommerce_order = frappe.get_doc({"doctype": "WooCommerce Order"})
 		new_results = woocommerce_order.get_list(
-			args={"filters": filters, "page_lenth": page_length, "start": start, "as_doc": True}
+			args={"filters": filters, "page_length": page_length, "start": start, "as_doc": True}
 		)
 		for wc_order in new_results:
 			wc_orders.append(wc_order)
@@ -1072,19 +1169,28 @@ def create_contact(data, customer):
 		return
 
 	
-	contacts = get_contacts_linking_to("Customer", customer.name, fields=["name", "first_name", "email_ids", "phone_nos"])
-	create= True
-	for contact in contacts:
-		contact_email_ids = [email.email_id for email in contact.get("email_ids", [])]
-		contact_phone_nos = [phone.phone for phone in contact.get("phone_nos", [])]
+	# Numéros exploitables : le champ du site peut porter plusieurs numéros ou
+	# un format que le validateur frappe refuse — une commande ne doit JAMAIS
+	# échouer pour un téléphone (26 commandes perdues avant le 25/08/2026).
+	numeros = normaliser_numero(phone) if phone else []
 
-		if (phone and phone in contact_phone_nos):
-			create = False
+	contacts = get_contacts_linking_to("Customer", customer.name, fields=["name", "first_name", "email_ids", "phone_nos"])
+	correspondant = None
+	for c in contacts:
+		contact_phone_nos = [p.phone for p in c.get("phone_nos", [])]
+		if phone and (phone in contact_phone_nos or any(n in contact_phone_nos for n in numeros)):
+			correspondant = c
 			break
-	if not create:
-		contact = frappe.get_doc("Contact", contact.name)
+
+	if correspondant:
+		contact = frappe.get_doc("Contact", correspondant.name)
+		contact_email_ids = [e.email_id for e in contact.email_ids]
 		if email and email not in contact_email_ids:
-			contact.add_email(email, is_primary=1)
+			# Jamais un DEUXIÈME e-mail « principal » : la validation Contact le
+			# refuse (« Only one Email ID can be set as primary ») — c'était la
+			# cause n°1 des commandes web jamais créées (91 échecs).
+			has_primary = any(e.is_primary for e in contact.email_ids)
+			contact.add_email(email, is_primary=0 if has_primary else 1)
 			contact.flags.ignore_mandatory = True
 			contact.save()
 		return contact
@@ -1095,7 +1201,11 @@ def create_contact(data, customer):
 		contact.is_primary_contact = 1
 		contact.is_billing_contact = 1
 
-		if phone:
+		if numeros:
+			for i, num in enumerate(numeros):
+				contact.add_phone(num, is_primary_mobile_no=1 if i == 0 else 0,
+				                  is_primary_phone=1 if i == 0 else 0)
+		elif phone:
 			contact.add_phone(phone, is_primary_mobile_no=1, is_primary_phone=1)
 
 		if email:
@@ -1104,7 +1214,16 @@ def create_contact(data, customer):
 		contact.append("links", {"link_doctype": "Customer", "link_name": customer.name})
 
 		contact.flags.ignore_mandatory = True
-		contact.save()
+		try:
+			contact.save()
+		except frappe.InvalidPhoneNumberError:
+			# Numéro brut refusé par le validateur : on garde le contact SANS
+			# téléphone plutôt que de perdre la commande.
+			frappe.log_error("WooCommerce Sync: numero invalide",
+			                 f"Contact {contact.first_name} {contact.last_name}: "
+			                 f"telephone {phone!r} refuse, contact cree sans numero.")
+			contact.phone_nos = []
+			contact.save()
 
 		return contact
 
@@ -1259,30 +1378,42 @@ def get_contacts_linking_to(doctype, docname, fields=None):
 	return contacts
 
 def normaliser_numero(telephone_raw):
-    """Nettoie un numéro et renvoie 0, 1 ou 2 numéros (8 chiffres) possibles."""
-    tel = (telephone_raw or "").replace(" ", "").replace("-", "").replace("(", "").replace(")", "").replace(".", "")
-    if not tel:
-        return []
+    """Nettoie un numéro et renvoie la liste des numéros (8 chiffres) trouvés.
+
+    Le client peut saisir PLUSIEURS numéros dans le champ du site, séparés par
+    « / », « , », « ; »… (vu en réel : « 46 540 446 / 20 410 118 ») — chaque
+    partie est normalisée séparément. Les espaces INTERNES d'un même numéro
+    restent gérés (« 46 540 446 » = un seul numéro).
+    """
+    brut = telephone_raw or ""
+    for sep in ("/", ",", ";", "|", "\n"):
+        brut = brut.replace(sep, "\x00")
 
     nums = []
+    for partie in brut.split("\x00"):
+        tel = partie.replace(" ", "").replace("-", "").replace("(", "").replace(")", "").replace(".", "")
+        if not tel:
+            continue
 
-    # Gérer les préfixes internationaux uniquement si len > 8
-    if len(tel) > 8:
-        if tel.startswith("+216"):
-            tel = tel[4:]
-        elif tel.startswith("00216"):
-            tel = tel[5:]
-        elif tel.startswith("216"):
-            tel = tel[3:]
+        # Gérer les préfixes internationaux uniquement si len > 8
+        if len(tel) > 8:
+            if tel.startswith("+216"):
+                tel = tel[4:]
+            elif tel.startswith("00216"):
+                tel = tel[5:]
+            elif tel.startswith("216"):
+                tel = tel[3:]
 
-    if len(tel) == 8:
-        nums.append(tel)
-    elif len(tel) == 16:
-        # Cas où deux numéros sont concaténés
-        nums.append(tel[:8])
-        nums.append(tel[8:])
+        if len(tel) == 8:
+            nums.append(tel)
+        elif len(tel) == 16:
+            # Cas où deux numéros sont concaténés
+            nums.append(tel[:8])
+            nums.append(tel[8:])
 
-    return nums
+    # dédoublonnage en préservant l'ordre
+    vus = set()
+    return [n for n in nums if not (n in vus or vus.add(n))]
 
 
 def is_mobile_tunisien(num):
