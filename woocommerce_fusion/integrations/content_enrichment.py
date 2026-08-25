@@ -788,7 +788,27 @@ def _slugify(text: str) -> str:
 def _sanitize_html(html: str) -> str:
     html = re.sub(r"<\s*(script|style)\b.*?>.*?</\1\s*>", "", html, flags=re.I | re.S)
     html = re.sub(r"\son\w+\s*=\s*(['\"]).*?\1", "", html, flags=re.I)
-    return html
+    return _supprimer_sections_vides(html)
+
+
+def _supprimer_sections_vides(html: str) -> str:
+    """Retire les titres SANS contenu : un <h2> suivi directement d'un autre
+    <h2> (ou de la fin) devient un accordéon vide sur la boutique — vu en réel
+    avec « Présentation » nu devant « Présentation – {produit} ». Un <h3> est
+    vide s'il est suivi d'un titre quelconque ou de la fin. Boucle jusqu'à
+    stabilité (titres vides consécutifs)."""
+    if not html:
+        return html
+    precedent = None
+    while precedent != html:
+        precedent = html
+        # (?:(?!</?h2).)* : le contenu du titre ne peut pas contenir un autre
+        # <h2> — sans ce garde, le backtracking avalait des sections entières.
+        html = re.sub(r"<h2\b[^>]*>(?:(?!</?h2\b).)*</h2>\s*(?=<h2\b|$)",
+                      "", html, flags=re.I | re.S)
+        html = re.sub(r"<h3\b[^>]*>(?:(?!</?h[23]\b).)*</h3>\s*(?=<h[23]\b|$)",
+                      "", html, flags=re.I | re.S)
+    return html.strip()
 
 # --- vision: extraire identité ---
 def _extract_description_from_images(openai_client: OpenAI, model: str, images: List[str],context: List[str]) -> Dict[str, Any]:
@@ -1465,11 +1485,17 @@ def enrich_item_content_with_openai_search(
         # "}\n\n")
         sys2=("\n\n")
 
+    # ⚠️ NE PAS demander à la fois « <h2>Présentation</h2> » ET
+    # « <h2>Présentation – {mot-clé}</h2> » : le modèle, obéissant, sortait les
+    # DEUX titres — le premier restait un accordéon VIDE sur la boutique.
     sys3=("🧾 long_html must:\n"
     "• At least 800 words (to get green score)\n"
     "• Be semantic HTML using <h2>, <p>, <ul>, <li>\n"
     "• Contain the main keyword in at least one <h2> heading\n"
-    "• Start with a descriptive <h2>Présentation</h2>\n"
+    f"• Start DIRECTLY with <h2>Présentation – {focus_keyword}</h2> — this is the ONLY "
+    "'Présentation' heading; NEVER output a bare <h2>Présentation</h2> before it\n"
+    "• Every <h2> must be immediately followed by real content (<p> or <ul>) — "
+    "never two consecutive headings, never an empty section\n"
     "• Structure:\n"
     f"   <h2>Présentation – {focus_keyword} </h2> — introduction with focus keyword\n"
 
