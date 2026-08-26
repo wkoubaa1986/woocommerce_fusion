@@ -791,19 +791,31 @@ class SynchroniseItem(SynchroniseWooCommerce):
 				else:
 
 					woo_parent_id = frappe.db.get_value("Item WooCommerce Server", {"parent": frappe.db.get_value("Item", self.item.item.item_code, "variant_of") , "parenttype": "Item", "parentfield": "woocommerce_servers", "woocommerce_server": self.woocommerce_product.woocommerce_server, "enabled": 1}, "woocommerce_id")
-					payload_P={}
-					payload_P["tags"] = (wc_server.get(f"products/{woo_parent_id}").json() or {}).get("tags", [])
-					payload_P["tags"].append({"id": Promo_id})	
+					# Sans lien parent actif, products/None ferait une requête absurde.
+					if woo_parent_id:
+						payload_P={}
+						payload_P["tags"] = (wc_server.get(f"products/{woo_parent_id}").json() or {}).get("tags", [])
+						payload_P["tags"].append({"id": Promo_id})
 
-					wc_server.put(f"products/{woo_parent_id}", payload_P).json()
+						wc_server.put(f"products/{woo_parent_id}", payload_P).json()
 
 			try:
-				print("Updating WC product with payload:", payload)
-				if not payload["brands"]:
-					payload["brands"] = [{}]
-				response = wc_server.put(f"products/{wc_id}", payload).json()
-				print(response.keys())
-				print(response.get("brands"))
+				if self.item.item.variant_of:
+					# Une variation WooCommerce n'a ni marque, ni catégories, ni tags
+					# propres : ces taxonomies vivent sur le produit PARENT, que la
+					# synchro du modèle (has_variants) pousse déjà — et un PUT
+					# products/{id} sur une variation répond 404
+					# woocommerce_rest_invalid_product_id (« utilisez le point de
+					# terminaison produits/variations »). Le tag promo des variantes
+					# est, lui, déjà propagé au parent par le bloc ci-dessus.
+					pass
+				else:
+					print("Updating WC product with payload:", payload)
+					if not payload["brands"]:
+						payload["brands"] = [{}]
+					response = wc_server.put(f"products/{wc_id}", payload).json()
+					print(response.keys())
+					print(response.get("brands"))
 			except Exception as e:
 				frappe.log_error("WooCommerce Product Update Brand attribute Error", frappe.get_traceback())
 				return {
