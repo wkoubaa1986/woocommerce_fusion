@@ -135,6 +135,12 @@ doc_events = {
 	# 	"on_update": "woocommerce_fusion.tasks.sync_items.run_item_sync_from_hook",
 	# 	"after_insert": "woocommerce_fusion.tasks.sync_items.run_item_sync_from_hook",
 	# },
+	# La bascule de « Rupture de stock (site web) » pousse l'état au site tout
+	# de suite (modèle -> toutes ses variantes). Volontairement distinct du
+	# run_item_sync_from_hook ci-dessus, resté débranché.
+	"Item": {
+		"on_update": "woocommerce_fusion.tasks.stock_update.pousser_rupture_depuis_fiche",
+	},
 }
 
 # Scheduled Tasks
@@ -276,6 +282,7 @@ fixtures = [
 					"Address-woocommerce_identifier",
 					"Item-woocommerce_servers",
 					"Item-custom_woocommerce_tab",
+					"Item-custom_rupture_site_web",
 				),
 			]
 		],

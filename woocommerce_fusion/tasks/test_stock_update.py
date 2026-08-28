@@ -5,6 +5,8 @@ from frappe import _dict
 from frappe.tests.utils import FrappeTestCase
 
 from woocommerce_fusion.tasks.stock_update import (
+	pousser_rupture_depuis_fiche,
+	rupture_forcee,
 	update_stock_levels_for_all_enabled_items_in_background,
 	update_stock_levels_on_woocommerce_site,
 )
@@ -95,6 +97,7 @@ class TestWooCommerceStockSync(FrappeTestCase):
 				]
 			),
 		]
+		mock_frappe.db.get_value.return_value = None  # le modèle n'est pas en rupture
 
 		# Set up a dummy bin list with stock in two Warehouses
 		bin_list = [
@@ -163,3 +166,149 @@ class TestWooCommerceStockSync(FrappeTestCase):
 			"woocommerce_fusion.tasks.stock_update.update_stock_levels_on_woocommerce_site",
 			item_code="Item-2-499",  # Here we'd check for the last `item_code` being passed.
 		)
+
+
+class TestRuptureSiteWeb(FrappeTestCase):
+	"""La case « Rupture de stock (site web) » force outofstock, quelles que
+	soient les quantités — décision utilisateur 28/08/2026."""
+
+	def _montage(self, mock_wc_api, mock_frappe, item, get_value=None):
+		mock_frappe.get_doc.return_value = item
+		mock_frappe.db.get_value.return_value = get_value
+		mock_frappe.get_list.return_value = [frappe._dict(warehouse="Warehouse A", actual_qty=7)]
+		mock_frappe.get_cached_doc.return_value = frappe._dict(
+			woocommerce_server="woo1.example.com",
+			enable_sync=1,
+			enable_stock_level_synchronisation=1,
+			warehouses=[frappe._dict(warehouse="Warehouse A")],
+		)
+		reponse = Mock()
+		reponse.status_code = 200
+		api = MagicMock()
+		api.put.return_value = reponse
+		mock_wc_api.return_value = api
+		return api
+
+	@patch("woocommerce_fusion.tasks.stock_update.frappe")
+	@patch("woocommerce_fusion.tasks.stock_update.APIWithRequestLogging", autospec=True)
+	def test_rupture_directe_pousse_zero_et_outofstock(self, mock_wc_api, mock_frappe):
+		item = frappe._dict(
+			woocommerce_servers=[
+				frappe._dict(woocommerce_id=1, woocommerce_server="woo1.example.com", enabled=1)
+			],
+			is_stock_item=1,
+			disabled=0,
+			custom_rupture_site_web=1,
+		)
+		api = self._montage(mock_wc_api, mock_frappe, item)
+		update_stock_levels_on_woocommerce_site("x")
+		# Rupture directe : plus vendable ET retiré du catalogue.
+		self.assertEqual(
+			api.put.call_args.kwargs["data"],
+			{"stock_quantity": 0, "stock_status": "outofstock", "catalog_visibility": "hidden"},
+		)
+
+	@patch("woocommerce_fusion.tasks.stock_update.frappe")
+	@patch("woocommerce_fusion.tasks.stock_update.APIWithRequestLogging", autospec=True)
+	def test_rupture_par_le_modele(self, mock_wc_api, mock_frappe):
+		variante = frappe._dict(
+			woocommerce_servers=[
+				frappe._dict(woocommerce_id=101, woocommerce_server="woo1.example.com", enabled=1)
+			],
+			is_stock_item=1,
+			disabled=0,
+			variant_of="MODELE",
+			custom_rupture_site_web=0,
+		)
+		api = self._montage(mock_wc_api, mock_frappe, variante, get_value=1)
+		mock_frappe.get_doc.side_effect = [
+			variante,
+			frappe._dict(
+				woocommerce_servers=[
+					frappe._dict(woocommerce_id=100, woocommerce_server="woo1.example.com", enabled=1)
+				]
+			),
+		]
+		update_stock_levels_on_woocommerce_site("x")
+		self.assertEqual(api.put.call_args.kwargs["endpoint"], "products/100/variations/101")
+		# Une VARIATION n'a pas de catalog_visibility : elle devient juste
+		# non sélectionnable — le masquage du produit passe par le parent.
+		self.assertEqual(
+			api.put.call_args.kwargs["data"],
+			{"stock_quantity": 0, "stock_status": "outofstock"},
+		)
+
+	@patch("woocommerce_fusion.tasks.stock_update.frappe")
+	@patch("woocommerce_fusion.tasks.stock_update.APIWithRequestLogging", autospec=True)
+	def test_decochage_renvoie_le_statut_reel(self, mock_wc_api, mock_frappe):
+		# forcer_statut : après décochage, une variation Woo qui ne gère pas les
+		# quantités doit quand même repasser instock.
+		item = frappe._dict(
+			woocommerce_servers=[
+				frappe._dict(woocommerce_id=1, woocommerce_server="woo1.example.com", enabled=1)
+			],
+			is_stock_item=1,
+			disabled=0,
+			custom_rupture_site_web=0,
+		)
+		api = self._montage(mock_wc_api, mock_frappe, item)
+		update_stock_levels_on_woocommerce_site("x", forcer_statut=True)
+		# Décochage : redevient vendable ET réapparaît au catalogue.
+		self.assertEqual(
+			api.put.call_args.kwargs["data"],
+			{"stock_quantity": 7, "stock_status": "instock", "catalog_visibility": "visible"},
+		)
+
+	@patch("woocommerce_fusion.tasks.stock_update.frappe")
+	@patch("woocommerce_fusion.tasks.stock_update.APIWithRequestLogging", autospec=True)
+	def test_synchro_normale_inchangee(self, mock_wc_api, mock_frappe):
+		# Sans rupture ni forcer_statut : la donnée poussée reste EXACTEMENT
+		# celle d'avant (pas de stock_status) — comportement historique intact.
+		item = frappe._dict(
+			woocommerce_servers=[
+				frappe._dict(woocommerce_id=1, woocommerce_server="woo1.example.com", enabled=1)
+			],
+			is_stock_item=1,
+			disabled=0,
+		)
+		api = self._montage(mock_wc_api, mock_frappe, item)
+		update_stock_levels_on_woocommerce_site("x")
+		self.assertEqual(api.put.call_args.kwargs["data"], {"stock_quantity": 7})
+
+	def test_rupture_forcee_pure(self):
+		self.assertTrue(rupture_forcee(frappe._dict(custom_rupture_site_web=1)))
+		self.assertFalse(rupture_forcee(frappe._dict(custom_rupture_site_web=0)))
+
+	@patch("woocommerce_fusion.tasks.stock_update.frappe")
+	def test_bascule_sur_modele_deploie_les_variantes(self, mock_frappe):
+		mock_frappe.flags.in_test = False
+		mock_frappe.flags.in_migrate = False
+		mock_frappe.flags.in_install = False
+		mock_frappe.db.count.return_value = 1
+		mock_frappe.get_all.return_value = ["VAR-1", "VAR-2"]
+		doc = MagicMock()
+		doc.get.side_effect = lambda k: {"custom_rupture_site_web": 1}.get(k)
+		doc.get_doc_before_save.return_value = frappe._dict(custom_rupture_site_web=0)
+		doc.has_variants = 1
+		doc.name = "MODELE"
+		pousser_rupture_depuis_fiche(doc)
+		# 2 variantes (statut) + 1 masquage du produit parent
+		self.assertEqual(mock_frappe.enqueue.call_count, 3)
+		stocks = [c for c in mock_frappe.enqueue.call_args_list if "forcer_statut" in c.kwargs]
+		visibilite = [c for c in mock_frappe.enqueue.call_args_list if "cacher" in c.kwargs]
+		self.assertEqual([c.kwargs["item_code"] for c in stocks], ["VAR-1", "VAR-2"])
+		self.assertTrue(all(c.kwargs["forcer_statut"] for c in stocks))
+		self.assertEqual(len(visibilite), 1)
+		self.assertEqual(visibilite[0].kwargs["item_code"], "MODELE")
+		self.assertEqual(visibilite[0].kwargs["cacher"], 1)
+
+	@patch("woocommerce_fusion.tasks.stock_update.frappe")
+	def test_pas_denvoi_sans_changement(self, mock_frappe):
+		mock_frappe.flags.in_test = False
+		mock_frappe.flags.in_migrate = False
+		mock_frappe.flags.in_install = False
+		doc = MagicMock()
+		doc.get.side_effect = lambda k: {"custom_rupture_site_web": 1}.get(k)
+		doc.get_doc_before_save.return_value = frappe._dict(custom_rupture_site_web=1)
+		pousser_rupture_depuis_fiche(doc)
+		mock_frappe.enqueue.assert_not_called()

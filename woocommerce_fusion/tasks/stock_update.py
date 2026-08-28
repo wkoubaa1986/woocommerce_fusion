@@ -5,6 +5,19 @@ import frappe
 from woocommerce_fusion.tasks.utils import APIWithRequestLogging
 
 
+def rupture_forcee(item) -> bool:
+	"""La rupture EFFECTIVE d'un article : sa case « Rupture de stock (site
+	web) », ou celle de son article MODÈLE — un modèle coché met toutes ses
+	variantes en rupture, une variante peut aussi l'être seule (28/08/2026)."""
+	if item.get("custom_rupture_site_web"):
+		return True
+	if item.get("variant_of"):
+		return bool(
+			frappe.db.get_value("Item", item.variant_of, "custom_rupture_site_web")
+		)
+	return False
+
+
 def update_stock_levels_for_woocommerce_item(doc, method):
 	if not frappe.flags.in_test:
 		if doc.doctype in ("Stock Entry", "Stock Reconciliation", "Sales Invoice", "Delivery Note"):
@@ -29,6 +42,89 @@ def update_stock_levels_for_woocommerce_item(doc, method):
 						enqueue_after_commit=True,
 						item_code=item_code,
 					)
+
+
+def pousser_rupture_depuis_fiche(doc, method=None):
+	"""Hook Item.on_update : quand la case « Rupture de stock (site web) »
+	bascule, pousse l'état au site SANS attendre un mouvement de stock.
+
+	- article MODÈLE coché/décoché : toutes ses variantes sont (re)poussées —
+	  cocher le modèle met tout en rupture, le décocher restaure chaque
+	  variante selon son stock réel (sauf celles cochées individuellement) ;
+	- article simple ou variante : lui seul.
+	La routine de stock reste inchangée : elle repasse par rupture_forcee() à
+	chaque mouvement, donc une case cochée continue d'imposer 0."""
+	if frappe.flags.in_test or frappe.flags.in_migrate or frappe.flags.in_install:
+		return
+	avant = doc.get_doc_before_save()
+	etat = 1 if doc.get("custom_rupture_site_web") else 0
+	if avant is not None and (1 if avant.get("custom_rupture_site_web") else 0) == etat:
+		return
+	if avant is None and not etat:
+		return
+	if (
+		frappe.db.count(
+			"WooCommerce Server", {"enable_sync": 1, "enable_stock_level_synchronisation": 1}
+		)
+		== 0
+	):
+		return
+
+	if doc.has_variants:
+		cibles = frappe.get_all(
+			"Item", filters={"variant_of": doc.name, "disabled": 0}, pluck="name"
+		)
+		# Le produit variable lui-même sort du catalogue (ou y revient).
+		frappe.enqueue(
+			"woocommerce_fusion.tasks.stock_update.pousser_visibilite_produit",
+			enqueue_after_commit=True,
+			item_code=doc.name,
+			cacher=etat,
+		)
+	else:
+		cibles = [doc.name]
+	for item_code in cibles:
+		frappe.enqueue(
+			"woocommerce_fusion.tasks.stock_update.update_stock_levels_on_woocommerce_site",
+			enqueue_after_commit=True,
+			item_code=item_code,
+			forcer_statut=True,
+		)
+
+
+def pousser_visibilite_produit(item_code, cacher):
+	"""Cache (ou réaffiche) le PRODUIT ENTIER sur le site — pour un article
+	MODÈLE coché : ses variations passent en rupture (fan-out) ET le produit
+	sort du catalogue ; décoché, il revient. `cacher` : 1/0."""
+	item = frappe.get_doc("Item", item_code)
+	for wc_site in item.woocommerce_servers:
+		if not wc_site.woocommerce_id:
+			continue
+		wc_server = frappe.get_cached_doc("WooCommerce Server", wc_site.woocommerce_server)
+		if (
+			not wc_server
+			or not wc_server.enable_sync
+			or not wc_site.enabled
+			or not wc_server.enable_stock_level_synchronisation
+		):
+			continue
+		wc_api = APIWithRequestLogging(
+			url=wc_server.woocommerce_server_url,
+			consumer_key=wc_server.api_consumer_key,
+			consumer_secret=wc_server.api_consumer_secret,
+			version="wc/v3",
+			timeout=40,
+		)
+		data_to_post = {
+			"catalog_visibility": "hidden" if frappe.utils.cint(cacher) else "visible",
+			"stock_status": "outofstock" if frappe.utils.cint(cacher) else "instock",
+		}
+		response = wc_api.put(endpoint=f"products/{wc_site.woocommerce_id}", data=data_to_post)
+		if response.status_code != 200:
+			frappe.log_error(
+				"WooCommerce Error",
+				f"Visibilite produit: statut {response.status_code}\n{response.text}"[:2000],
+			)
 
 
 def update_stock_levels_for_all_enabled_items_in_background():
@@ -60,7 +156,7 @@ def update_stock_levels_for_all_enabled_items_in_background():
 
 
 @frappe.whitelist()
-def update_stock_levels_on_woocommerce_site(item_code):
+def update_stock_levels_on_woocommerce_site(item_code, forcer_statut=False):
 	"""
 	Updates stock levels of an item on all its associated WooCommerce sites.
 
@@ -111,6 +207,30 @@ def update_stock_levels_on_woocommerce_site(item_code):
 						)
 					)
 				}
+				# Rupture forcée depuis la fiche article : 0 + outofstock, quel que
+				# soit le stock réel. Passer par ICI (et non par un envoi ponctuel)
+				# garantit qu'un mouvement de stock ultérieur re-pousse 0 tant que
+				# la case est cochée, au lieu de restaurer la vraie quantité.
+				est_variation = bool(item.variant_of)
+				if rupture_forcee(item):
+					data_to_post = {"stock_quantity": 0, "stock_status": "outofstock"}
+					# L'article en rupture DISPARAÎT du site (décision 28/08/2026) —
+					# sauf une variation seule : le produit reste affiché avec ses
+					# autres déclinaisons, celle-ci devient juste non sélectionnable
+					# (l'endpoint variations n'a d'ailleurs pas catalog_visibility).
+					if not est_variation:
+						data_to_post["catalog_visibility"] = "hidden"
+				elif forcer_statut:
+					# Décochage de la rupture : une variation Woo qui ne gère pas les
+					# quantités ignorerait stock_quantity et resterait bloquée en
+					# rupture — on renvoie donc AUSSI le statut, déduit du stock réel.
+					# (Quand manage_stock est actif côté Woo, ce statut est recalculé
+					# de toute façon : l'envoyer est sans effet.)
+					data_to_post["stock_status"] = (
+						"instock" if data_to_post["stock_quantity"] > 0 else "outofstock"
+					)
+					if not est_variation:
+						data_to_post["catalog_visibility"] = "visible"
 
 				try:
 					parent_item_id = item.variant_of
