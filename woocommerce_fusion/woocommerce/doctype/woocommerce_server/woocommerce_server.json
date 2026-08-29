@@ -70,6 +70,7 @@
   "item_stock_section",
   "enable_stock_level_synchronisation",
   "rupture_naturelle_stock",
+  "affichage_rupture",
   "warehouses",
   "subtract_reserved_stock",
   "item_fields_section",
@@ -585,12 +586,21 @@
    "fieldname": "rupture_naturelle_stock",
    "fieldtype": "Check",
    "label": "Rupture naturelle bas\u00e9e sur le stock"
+  },
+  {
+   "default": "\u00c9puis\u00e9 (produit visible)",
+   "depends_on": "enable_stock_level_synchronisation",
+   "description": "\u00ab \u00c9puis\u00e9 (produit visible) \u00bb : l'article reste sur le site avec la mention \u00c9puis\u00e9, non achetable. \u00ab Masqu\u00e9 du catalogue \u00bb : il dispara\u00eet compl\u00e8tement du site.",
+   "fieldname": "affichage_rupture",
+   "fieldtype": "Select",
+   "label": "Affichage d'un article en rupture",
+   "options": "\u00c9puis\u00e9 (produit visible)\nMasqu\u00e9 du catalogue"
   }
  ],
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2026-08-29 15:04:42.918451",
+ "modified": "2026-08-29 15:32:03.854008",
  "modified_by": "Administrator",
  "module": "WooCommerce",
  "name": "WooCommerce Server",

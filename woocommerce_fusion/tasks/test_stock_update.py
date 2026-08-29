@@ -183,7 +183,8 @@ class TestRuptureSiteWeb(FrappeTestCase):
 			woocommerce_server="woo1.example.com",
 			enable_sync=1,
 			enable_stock_level_synchronisation=1,
-				rupture_naturelle_stock=1,
+			rupture_naturelle_stock=1,
+			affichage_rupture="Masqué du catalogue",
 			warehouses=[frappe._dict(warehouse="Warehouse A")],
 		)
 		reponse = Mock()
@@ -380,6 +381,26 @@ class TestModeManuel(FrappeTestCase):
 	def test_la_case_gagne_aussi_en_mode_manuel(self, mock_wc_api, mock_frappe):
 		api = self._montage(
 			mock_wc_api, mock_frappe, self._item(custom_rupture_site_web=1)
+		)
+		update_stock_levels_on_woocommerce_site("x")
+		# Défaut 29/08 : le produit RESTE VISIBLE avec la mention Épuisé.
+		self.assertEqual(
+			api.put.call_args.kwargs["data"],
+			{"stock_quantity": 0, "stock_status": "outofstock", "catalog_visibility": "visible"},
+		)
+
+	@patch("woocommerce_fusion.tasks.stock_update.frappe")
+	@patch("woocommerce_fusion.tasks.stock_update.APIWithRequestLogging", autospec=True)
+	def test_mode_masque_fait_disparaitre(self, mock_wc_api, mock_frappe):
+		api = self._montage(
+			mock_wc_api, mock_frappe, self._item(custom_rupture_site_web=1)
+		)
+		mock_frappe.get_cached_doc.return_value = frappe._dict(
+			woocommerce_server="woo1.example.com",
+			enable_sync=1,
+			enable_stock_level_synchronisation=1,
+			affichage_rupture="Masqué du catalogue",
+			warehouses=[frappe._dict(warehouse="Warehouse A")],
 		)
 		update_stock_levels_on_woocommerce_site("x")
 		self.assertEqual(

@@ -18,6 +18,14 @@ def rupture_forcee(item) -> bool:
 	return False
 
 
+def _masquer_rupture(wc_server) -> bool:
+	"""Le réglage « Affichage d'un article en rupture » du serveur : par défaut
+	l'article reste VISIBLE avec la mention Épuisé (décision 29/08/2026, après
+	essai réel — la disparition pure surprenait) ; « Masqué du catalogue »
+	restaure l'ancien comportement."""
+	return (wc_server.get("affichage_rupture") or "") == "Masqué du catalogue"
+
+
 def update_stock_levels_for_woocommerce_item(doc, method):
 	if not frappe.flags.in_test:
 		if doc.doctype in ("Stock Entry", "Stock Reconciliation", "Sales Invoice", "Delivery Note"):
@@ -125,8 +133,9 @@ def pousser_visibilite_produit(item_code, cacher):
 			version="wc/v3",
 			timeout=40,
 		)
+		cacher_vraiment = frappe.utils.cint(cacher) and _masquer_rupture(wc_server)
 		data_to_post = {
-			"catalog_visibility": "hidden" if frappe.utils.cint(cacher) else "visible",
+			"catalog_visibility": "hidden" if cacher_vraiment else "visible",
 			"stock_status": "outofstock" if frappe.utils.cint(cacher) else "instock",
 		}
 		response = wc_api.put(endpoint=f"products/{wc_site.woocommerce_id}", data=data_to_post)
@@ -238,12 +247,14 @@ def update_stock_levels_on_woocommerce_site(item_code, forcer_statut=False):
 				est_variation = bool(item.variant_of)
 				if rupture_forcee(item):
 					data_to_post = {"stock_quantity": 0, "stock_status": "outofstock"}
-					# L'article en rupture DISPARAÎT du site (décision 28/08/2026) —
-					# sauf une variation seule : le produit reste affiché avec ses
-					# autres déclinaisons, celle-ci devient juste non sélectionnable
+					# Visibilité selon le réglage du serveur : Épuisé visible (défaut)
+					# ou masqué du catalogue. Jamais sur une variation seule — le
+					# produit reste affiché, la déclinaison devient non sélectionnable
 					# (l'endpoint variations n'a d'ailleurs pas catalog_visibility).
 					if not est_variation:
-						data_to_post["catalog_visibility"] = "hidden"
+						data_to_post["catalog_visibility"] = (
+							"hidden" if _masquer_rupture(wc_server) else "visible"
+						)
 				elif not bool(wc_server.get("rupture_naturelle_stock")):
 					# MODE MANUEL (défaut, décision 29/08/2026) : AUCUNE quantité
 					# réelle ne part au site — le stock ERPNext (souvent négatif) ne
