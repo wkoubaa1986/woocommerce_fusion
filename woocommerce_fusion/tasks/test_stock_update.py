@@ -407,3 +407,30 @@ class TestModeManuel(FrappeTestCase):
 			{"manage_stock": False, "stock_status": "instock"},
 		)
 		self.assertIn("variations", api.put.call_args.kwargs["endpoint"])
+
+	@patch("woocommerce_fusion.tasks.stock_update.frappe")
+	@patch("woocommerce_fusion.tasks.stock_update.APIWithRequestLogging", autospec=True)
+	def test_article_hors_stock_pousse_quand_meme(self, mock_wc_api, mock_frappe):
+		# Les variantes réelles (AP-P…) sont souvent is_stock_item=0 : en mode
+		# manuel elles doivent être poussées quand même — constaté le 29/08 en
+		# prod, la cascade ne touchait AUCUNE des 45 variations.
+		api = self._montage(mock_wc_api, mock_frappe, self._item(is_stock_item=0))
+		update_stock_levels_on_woocommerce_site("x")
+		self.assertEqual(
+			api.put.call_args.kwargs["data"],
+			{"manage_stock": False, "stock_status": "instock"},
+		)
+
+	@patch("woocommerce_fusion.tasks.stock_update.frappe")
+	@patch("woocommerce_fusion.tasks.stock_update.APIWithRequestLogging", autospec=True)
+	def test_mode_naturel_saute_toujours_les_articles_hors_stock(self, mock_wc_api, mock_frappe):
+		api = self._montage(mock_wc_api, mock_frappe, self._item(is_stock_item=0))
+		mock_frappe.get_cached_doc.return_value = frappe._dict(
+			woocommerce_server="woo1.example.com",
+			enable_sync=1,
+			enable_stock_level_synchronisation=1,
+			rupture_naturelle_stock=1,
+			warehouses=[frappe._dict(warehouse="Warehouse A")],
+		)
+		update_stock_levels_on_woocommerce_site("x")
+		api.put.assert_not_called()

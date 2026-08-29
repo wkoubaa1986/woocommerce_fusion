@@ -176,7 +176,12 @@ def update_stock_levels_on_woocommerce_site(item_code, forcer_statut=False):
 	"""
 	item = frappe.get_doc("Item", item_code)
 
-	if len(item.woocommerce_servers) == 0 or not item.is_stock_item or item.disabled:
+	# ⚠️ NE PAS exiger is_stock_item ici : les VARIANTES du catalogue réel sont
+	# souvent des articles hors stock (constaté sur AP-P le 29/08 : 45 variantes
+	# is_stock_item=0 → la cascade de rupture ne poussait RIEN). En mode manuel
+	# la disponibilité n'a rien à voir avec le stock ; le mode naturel, lui,
+	# refiltre plus bas — il n'a pas de quantités sans article de stock.
+	if len(item.woocommerce_servers) == 0 or item.disabled:
 		return False
 	else:
 		bins = frappe.get_list(
@@ -204,6 +209,15 @@ def update_stock_levels_on_woocommerce_site(item_code, forcer_statut=False):
 					version="wc/v3",
 					timeout=40,
 				)
+
+				# Mode NATUREL sans article de stock : aucune quantité à pousser —
+				# on saute, comme historiquement. La rupture forcée passe toujours.
+				if (
+					bool(wc_server.get("rupture_naturelle_stock"))
+					and not item.is_stock_item
+					and not rupture_forcee(item)
+				):
+					continue
 
 				# Sum all quantities from select warehouses and round the total down (WooCommerce API doesn't accept float values)
 				data_to_post = {
