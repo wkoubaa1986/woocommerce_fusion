@@ -415,3 +415,99 @@ def force_release_sync_lock():
         "message": "Verrou libéré avec succès",
         "previous_lock": lock_info
     }
+
+
+# 🎯 Synchronisation d'une SÉLECTION d'articles (demande 29/08/2026) : mêmes
+# verrou, rapport et unité de travail (run_item_sync) que la synchro de masse —
+# seule la source change : les articles cochés dans la liste.
+
+@frappe.whitelist()
+def start_sync_selection(item_codes):
+    import json as _json
+
+    codes = _json.loads(item_codes) if isinstance(item_codes, str) else (item_codes or [])
+    codes = [c for c in codes if c and frappe.db.exists("Item", c)]
+    if not codes:
+        frappe.throw("Sélectionnez au moins un article dans la liste.")
+
+    lock_info = get_sync_lock_info()
+    if lock_info:
+        frappe.throw(
+            f"Une synchronisation est déjà en cours (mode={lock_info.get('sync_mode')}, "
+            f"report={lock_info.get('report_id')}, started_at={lock_info.get('started_at')}). "
+            f"Veuillez patienter qu'elle se termine.",
+            title="Synchronisation déjà en cours",
+        )
+
+    report = frappe.get_doc({
+        "doctype": "WooCommerce Sync Report",
+        "status": "Running",
+        "started_at": now(),
+        "batch_size": len(codes),
+        "current_batch_offset": 0,
+        "total_batches": 1,
+        "total_items": len(codes),
+        "success_count": 0,
+        "failed_count": 0,
+        "sync_mode": "selection",
+    })
+    report.insert(ignore_permissions=True)
+    frappe.db.commit()
+
+    frappe.enqueue(
+        method="woocommerce_fusion.tasks.sync_job.sync_selected_items",
+        queue="long",
+        timeout=2 * 60 * 60,
+        job_name=f"Sync selection ({len(codes)} items)",
+        item_codes=codes,
+        report_id=report.name,
+    )
+
+    return {
+        "status": "started",
+        "message": f"Synchronisation de {len(codes)} article(s) sélectionné(s) démarrée",
+        "report_id": report.name,
+        "report_url": f"/app/woocommerce-sync-report/{report.name}",
+        "sync_mode": "selection",
+    }
+
+
+def sync_selected_items(item_codes, report_id=None):
+    """La tournée d'une sélection — un seul lot, pas de chaînage. Le marqueur
+    global wc_last_sync_date_items n'est PAS touché : une sélection partielle
+    ne doit pas faire croire au mode « modified » que tout est à jour."""
+    frappe.cache().setex(SYNC_LOCK_KEY, SYNC_LOCK_TIMEOUT, json.dumps({
+        "report_id": report_id, "sync_mode": "selection", "started_at": now(),
+    }))
+    try:
+        for item_code in item_codes:
+            try:
+                run_item_sync(item_code)
+                frappe.db.commit()
+                log_sync_result(item_code, "Success", 0)
+                if report_id:
+                    update_sync_report(report_id, item_code, "Success", 0)
+            except Exception as e:
+                frappe.db.rollback()
+                frappe.logger().exception(f"[SYNC] Failed item={item_code} (selection)")
+                log_sync_result(item_code, "Failed", 0, str(e), frappe.get_traceback())
+                if report_id:
+                    update_sync_report(report_id, item_code, "Failed", 0, str(e))
+
+        if report_id:
+            try:
+                report = frappe.get_doc("WooCommerce Sync Report", report_id)
+                report.status = "Completed"
+                report.completed_at = now()
+                if report.started_at and report.completed_at:
+                    report.duration_seconds = int(time_diff_in_seconds(
+                        get_datetime(report.completed_at), get_datetime(report.started_at)))
+                report.save(ignore_permissions=True)
+                frappe.db.commit()
+            except Exception:
+                frappe.logger().exception(f"[SYNC] Failed to finalize selection report {report_id}")
+    finally:
+        try:
+            frappe.cache().delete(SYNC_LOCK_KEY)
+        except Exception:
+            frappe.logger().exception("[SYNC] Failed to release selection lock")

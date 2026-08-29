@@ -1,5 +1,40 @@
 frappe.listview_settings['Item'] = {
     onload: function(listview) {
+        // 🎯 Synchroniser UNIQUEMENT les articles cochés dans la liste
+        // (demande 29/08/2026) — même verrou et même rapport que la synchro
+        // de masse, seule la source change.
+        listview.page.add_inner_button(__('Sync Sélection'), function() {
+            const coches = (listview.get_checked_items() || []).map(d => d.name);
+            if (!coches.length) {
+                frappe.msgprint(__('Cochez d\'abord un ou plusieurs articles dans la liste.'));
+                return;
+            }
+            frappe.confirm(
+                __('Synchroniser {0} article(s) sélectionné(s) vers WooCommerce ?', [coches.length]),
+                function() {
+                    frappe.call({
+                        method: 'woocommerce_fusion.tasks.sync_job.start_sync_selection',
+                        args: { item_codes: JSON.stringify(coches) },
+                        freeze: true,
+                        freeze_message: __('Démarrage de la synchronisation…'),
+                        callback: function(r) {
+                            if (!r.message) return;
+                            frappe.show_alert({
+                                message: r.message.message || __('Synchronisation de la sélection démarrée'),
+                                indicator: 'green'
+                            });
+                            listview.clear_checked_items && listview.clear_checked_items();
+                            if (r.message.report_url) {
+                                setTimeout(function() {
+                                    frappe.set_route(r.message.report_url.replace('/app/', ''));
+                                }, 1000);
+                            }
+                        }
+                    });
+                }
+            );
+        });
+
         // Ajouter le bouton personnalisé
         listview.page.add_inner_button(__('Sync Active Items'), function() {
             frappe.prompt([
