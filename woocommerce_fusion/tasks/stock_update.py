@@ -26,9 +26,19 @@ def update_stock_levels_for_woocommerce_item(doc, method):
 			# check and must not depend on the submitting user's read access to
 			# "WooCommerce Server" (otherwise low-permission users get a PermissionError
 			# when submitting Delivery Notes / Sales Invoices).
+			#
+			# ⚠️ « rupture_naturelle_stock » (décision 29/08/2026) : en MODE MANUEL
+			# (case décochée, le défaut), les mouvements de stock n'ont AUCUN effet
+			# sur le site — seule la case « Rupture de stock (site web) » de
+			# l'article décide. On n'enqueue donc rien du tout.
 			if (
 				frappe.db.count(
-					"WooCommerce Server", {"enable_sync": 1, "enable_stock_level_synchronisation": 1}
+					"WooCommerce Server",
+					{
+						"enable_sync": 1,
+						"enable_stock_level_synchronisation": 1,
+						"rupture_naturelle_stock": 1,
+					},
 				)
 				> 0
 			):
@@ -220,6 +230,17 @@ def update_stock_levels_on_woocommerce_site(item_code, forcer_statut=False):
 					# (l'endpoint variations n'a d'ailleurs pas catalog_visibility).
 					if not est_variation:
 						data_to_post["catalog_visibility"] = "hidden"
+				elif not bool(wc_server.get("rupture_naturelle_stock")):
+					# MODE MANUEL (défaut, décision 29/08/2026) : AUCUNE quantité
+					# réelle ne part au site — le stock ERPNext (souvent négatif) ne
+					# doit jamais décider de la disponibilité web. L'article non coché
+					# est DISPONIBLE, point. manage_stock=False empêche AUSSI le site
+					# de se remettre tout seul en rupture quand ses propres compteurs
+					# tombent à zéro après des commandes web.
+					data_to_post = {"manage_stock": False, "stock_status": "instock"}
+					if forcer_statut and not est_variation:
+						# Décochage de la case : le produit revient au catalogue.
+						data_to_post["catalog_visibility"] = "visible"
 				elif forcer_statut:
 					# Décochage de la rupture : une variation Woo qui ne gère pas les
 					# quantités ignorerait stock_quantity et resterait bloquée en

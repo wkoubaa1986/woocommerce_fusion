@@ -69,6 +69,7 @@
   "enable_image_sync",
   "item_stock_section",
   "enable_stock_level_synchronisation",
+  "rupture_naturelle_stock",
   "warehouses",
   "subtract_reserved_stock",
   "item_fields_section",
@@ -576,12 +577,20 @@
    "fieldtype": "Link",
    "label": "Tax Account for Order Fee Lines",
    "options": "Account"
+  },
+  {
+   "default": "0",
+   "depends_on": "enable_stock_level_synchronisation",
+   "description": "Coch\u00e9 : les quantit\u00e9s r\u00e9elles d'ERPNext sont pouss\u00e9es au site (rupture automatique \u00e0 0). D\u00e9coch\u00e9 (d\u00e9faut) : AUCUNE quantit\u00e9 n'est pouss\u00e9e \u2014 la disponibilit\u00e9 est 100 % manuelle via la case \u00ab Rupture de stock (site web) \u00bb de l'article.",
+   "fieldname": "rupture_naturelle_stock",
+   "fieldtype": "Check",
+   "label": "Rupture naturelle bas\u00e9e sur le stock"
   }
  ],
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2025-09-05 10:50:19.502545",
+ "modified": "2026-08-29 15:04:42.918451",
  "modified_by": "Administrator",
  "module": "WooCommerce",
  "name": "WooCommerce Server",

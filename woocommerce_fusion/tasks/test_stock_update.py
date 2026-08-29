@@ -45,12 +45,14 @@ class TestWooCommerceStockSync(FrappeTestCase):
 				woocommerce_server="woo1.example.com",
 				enable_sync=1,
 				enable_stock_level_synchronisation=1,
+				rupture_naturelle_stock=1,
 				warehouses=[frappe._dict(warehouse="Warehouse A"), frappe._dict(warehouse="Warehouse B")],
 			),
 			frappe._dict(
 				woocommerce_server="woo2.example.com",
 				enable_sync=1,
 				enable_stock_level_synchronisation=1,
+				rupture_naturelle_stock=1,
 				warehouses=[frappe._dict(warehouse="Warehouse A"), frappe._dict(warehouse="Warehouse B")],
 			),
 		]
@@ -111,6 +113,7 @@ class TestWooCommerceStockSync(FrappeTestCase):
 			woocommerce_server="woo1.example.com",
 			enable_sync=1,
 			enable_stock_level_synchronisation=1,
+				rupture_naturelle_stock=1,
 			warehouses=[frappe._dict(warehouse="Warehouse A"), frappe._dict(warehouse="Warehouse B")],
 		)
 
@@ -180,6 +183,7 @@ class TestRuptureSiteWeb(FrappeTestCase):
 			woocommerce_server="woo1.example.com",
 			enable_sync=1,
 			enable_stock_level_synchronisation=1,
+				rupture_naturelle_stock=1,
 			warehouses=[frappe._dict(warehouse="Warehouse A")],
 		)
 		reponse = Mock()
@@ -312,3 +316,94 @@ class TestRuptureSiteWeb(FrappeTestCase):
 		doc.get_doc_before_save.return_value = frappe._dict(custom_rupture_site_web=1)
 		pousser_rupture_depuis_fiche(doc)
 		mock_frappe.enqueue.assert_not_called()
+
+
+class TestModeManuel(FrappeTestCase):
+	"""MODE MANUEL (défaut, décision 29/08/2026) : `rupture_naturelle_stock`
+	décoché sur le serveur — le stock réel d'ERPNext ne pousse JAMAIS la
+	disponibilité, seule la case « Rupture de stock (site web) » décide."""
+
+	def _montage(self, mock_wc_api, mock_frappe, item, get_value=None):
+		mock_frappe.get_doc.return_value = item
+		mock_frappe.db.get_value.return_value = get_value
+		# Stock réel à ZÉRO : en mode naturel il rendrait l'article épuisé —
+		# en mode manuel il ne doit avoir AUCUN effet.
+		mock_frappe.get_list.return_value = [frappe._dict(warehouse="Warehouse A", actual_qty=0)]
+		mock_frappe.get_cached_doc.return_value = frappe._dict(
+			woocommerce_server="woo1.example.com",
+			enable_sync=1,
+			enable_stock_level_synchronisation=1,
+			warehouses=[frappe._dict(warehouse="Warehouse A")],
+		)
+		reponse = Mock()
+		reponse.status_code = 200
+		api = MagicMock()
+		api.put.return_value = reponse
+		mock_wc_api.return_value = api
+		return api
+
+	def _item(self, **kw):
+		base = dict(
+			woocommerce_servers=[
+				frappe._dict(woocommerce_id=1, woocommerce_server="woo1.example.com", enabled=1)
+			],
+			is_stock_item=1,
+			disabled=0,
+		)
+		base.update(kw)
+		return frappe._dict(base)
+
+	@patch("woocommerce_fusion.tasks.stock_update.frappe")
+	@patch("woocommerce_fusion.tasks.stock_update.APIWithRequestLogging", autospec=True)
+	def test_stock_zero_reste_disponible(self, mock_wc_api, mock_frappe):
+		api = self._montage(mock_wc_api, mock_frappe, self._item())
+		update_stock_levels_on_woocommerce_site("x")
+		# Aucune quantité poussée, disponible, et le site cesse de gérer
+		# ses propres compteurs (manage_stock=False).
+		self.assertEqual(
+			api.put.call_args.kwargs["data"],
+			{"manage_stock": False, "stock_status": "instock"},
+		)
+
+	@patch("woocommerce_fusion.tasks.stock_update.frappe")
+	@patch("woocommerce_fusion.tasks.stock_update.APIWithRequestLogging", autospec=True)
+	def test_decochage_reaffiche_le_produit(self, mock_wc_api, mock_frappe):
+		api = self._montage(mock_wc_api, mock_frappe, self._item())
+		update_stock_levels_on_woocommerce_site("x", forcer_statut=True)
+		self.assertEqual(
+			api.put.call_args.kwargs["data"],
+			{"manage_stock": False, "stock_status": "instock", "catalog_visibility": "visible"},
+		)
+
+	@patch("woocommerce_fusion.tasks.stock_update.frappe")
+	@patch("woocommerce_fusion.tasks.stock_update.APIWithRequestLogging", autospec=True)
+	def test_la_case_gagne_aussi_en_mode_manuel(self, mock_wc_api, mock_frappe):
+		api = self._montage(
+			mock_wc_api, mock_frappe, self._item(custom_rupture_site_web=1)
+		)
+		update_stock_levels_on_woocommerce_site("x")
+		self.assertEqual(
+			api.put.call_args.kwargs["data"],
+			{"stock_quantity": 0, "stock_status": "outofstock", "catalog_visibility": "hidden"},
+		)
+
+	@patch("woocommerce_fusion.tasks.stock_update.frappe")
+	@patch("woocommerce_fusion.tasks.stock_update.APIWithRequestLogging", autospec=True)
+	def test_variation_sans_case_reste_disponible(self, mock_wc_api, mock_frappe):
+		# Variante d'un modèle NON coché (db.get_value -> None) : disponible,
+		# et jamais de catalog_visibility sur une variation.
+		item = self._item(variant_of="MODELE")
+		item.woocommerce_servers[0].woocommerce_id = 11
+		api = self._montage(mock_wc_api, mock_frappe, item, get_value=None)
+		mock_frappe.get_doc.side_effect = [
+			item,
+			frappe._dict(woocommerce_servers=[
+				frappe._dict(woocommerce_id=99, woocommerce_server="woo1.example.com")
+			]),
+		]
+		update_stock_levels_on_woocommerce_site("x")
+		self.assertEqual(
+			api.put.call_args.kwargs["data"],
+			{"manage_stock": False, "stock_status": "instock"},
+		)
+		self.assertIn("variations", api.put.call_args.kwargs["endpoint"])
