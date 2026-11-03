@@ -1925,12 +1925,8 @@ def _file_url_to_path(file_url: str) -> Optional[str]:
 
 
 def _is_probably_image_file(file_name: str, file_url: str) -> bool:
-    name = (file_name or "").lower()
-    url = (file_url or "").lower()
-    guess = mimetypes.guess_type(name or url)[0] or ""
-    if guess.startswith("image/"):
-        return True
-    return any((name.endswith(ext) or url.endswith(ext)) for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"))
+    # Même règle que le dédoublonnage et la retouche (item_images_treatment.IMAGE_EXTS + MIME).
+    return _is_image_url(file_url, file_name) or _is_image_url(file_name)
 
 
 def _safe_read_file_bytes(file_url: str) -> Optional[bytes]:
@@ -2987,7 +2983,7 @@ def treat_left_item_images(item_name: str, max_images: int = 10, preserve_order:
     )
 
     # keep only images
-    rows = [r for r in rows if _is_image_url( r.get("file_url"))]
+    rows = [r for r in rows if _is_image_url(r.get("file_url"), r.get("file_name"))]
     if not rows:
         return {"ok": False, "item": it.name, "message": "No image files attached."}
 

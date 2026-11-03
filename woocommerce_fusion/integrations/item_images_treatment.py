@@ -1170,20 +1170,30 @@
 #     return report
 import os
 import hashlib
+import mimetypes
 import frappe
 from frappe.utils.file_manager import get_file
 import io
 from PIL import Image, ImageOps
 
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+# Règle UNIQUE « ce fichier est une image » pour tout le pipeline (dédoublonnage, retouche IA,
+# envoi WooCommerce). `.jfif` / `.jpe` sont des JPEG ordinaires : sans eux, un article dont les
+# photos venaient d'un navigateur Windows (FF-I-90-LH, 03/11/2026) sortait du traitement IA en
+# silence et n'avait donc aucune image sur la boutique.
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".jpe", ".jfif", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
 
 
-def _is_image_url(url: str) -> bool:
-    if not url:
+def _is_image_url(url: str, filename: str | None = None) -> bool:
+    """Image d'après l'extension (liste ci-dessus) ou le type MIME deviné (image/*)."""
+    cand = (filename or url or "").strip()
+    if not cand:
         return False
-    base = url.split("?")[0].lower()
+    base = cand.split("?", 1)[0].split("#", 1)[0].lower()
     _, ext = os.path.splitext(base)
-    return ext in IMAGE_EXTS
+    if ext in IMAGE_EXTS:
+        return True
+    mt, _ = mimetypes.guess_type(base)
+    return bool(mt and mt.startswith("image/"))
 
 
 def _sha256_bytes(content: bytes) -> str:

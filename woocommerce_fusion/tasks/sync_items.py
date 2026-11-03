@@ -29,10 +29,9 @@ from woocommerce_fusion.woocommerce.woocommerce_api import (
 # add to your imports
 from woocommerce_fusion.integrations import wp_media
 from woocommerce_fusion.integrations.content_enrichment import generate_website_contenant, classify_item_group, retouch_item_images, classify_item_collections, treat_left_item_images
-from woocommerce_fusion.integrations.item_images_treatment import dedupe_item_images
+from woocommerce_fusion.integrations.item_images_treatment import dedupe_item_images, _is_image_url as _is_image_url_shared
 
 from typing import List
-import mimetypes
 import posixpath
 import re
 from urllib.parse import urljoin, urlparse
@@ -154,14 +153,8 @@ def _upload_item_images_to_wp_and_attach(wc_api, item, wc_product: dict) -> list
     item.reload()
 
     # -------- Helpers --------
-    def _is_image_url(url: str, filename: str | None = None) -> bool:
-        if not url and not filename:
-            return False
-        cand = (filename or url or "").lower()
-        mt, _ = mimetypes.guess_type(cand)
-        if mt and mt.startswith("image/"):
-            return True
-        return cand.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"))
+    # Règle d'image partagée avec le dédoublonnage et la retouche IA (item_images_treatment.IMAGE_EXTS).
+    _is_image_url = _is_image_url_shared
 
     def _abs_erpnext_url(file_url: str) -> str:
         u = (file_url or "").strip()
