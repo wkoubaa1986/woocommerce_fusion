@@ -2347,13 +2347,36 @@ def _image_de_la_reponse(resp):
     return None
 
 
-def _gemini_retoucher(client: genai.Client, img_bytes: bytes) -> tuple:
+CONSIGNE_MAX = 600
+
+
+def consigne_complete(consigne: str | None = None) -> str:
+    """La consigne générale, suivie de celle que l'utilisateur a écrite pour CETTE image (retouche manuelle). Pure.
+
+    Demande du 23/11/2026 : « si elle est traitée, on peut la retraiter, une image, en ajoutant une consigne ». Sa
+    consigne passe avant le cadrage et le fond ; elle ne permet de toucher ni au produit ni aux cotes, sauf si elle le
+    demande elle-même en toutes lettres."""
+    consigne = " ".join((consigne or "").split())[:CONSIGNE_MAX]
+    if not consigne:
+        return EDIT_PROMPT
+    return EDIT_PROMPT + (
+        "\n\nADDITIONAL INSTRUCTION FROM THE SHOP OWNER FOR THIS IMAGE (it may be written in French):\n"
+        '"""' + consigne.replace('"""', "'") + '"""\n'
+        "Apply this instruction. It has priority over the framing, background and lighting rules above. "
+        "It does not allow you to change the product itself, nor to remove or alter any dimension, number or label, "
+        "unless the instruction explicitly asks for it."
+    )
+
+
+def _gemini_retoucher(client: genai.Client, img_bytes: bytes, consigne: str | None = None) -> tuple:
     """Retouche une image. Renvoie (octets WEBP carrés 2000×2000, réussie, raison de l'échec).
+    `consigne` : ce que l'utilisateur demande en plus pour cette image (retouche manuelle).
 
     En cas d'échec, les octets sont l'image d'ORIGINE mise au carré : à l'appelant de décider quoi en faire — elle ne
     doit pas être prise pour une image retouchée."""
     base_im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     modele = _read_gemini_model(purpose="image")
+    demande = consigne_complete(consigne)
     derniere = None
     essais = [c for c in (_config_retouche(), None)]
     if essais[0] is None:
@@ -2361,9 +2384,9 @@ def _gemini_retoucher(client: genai.Client, img_bytes: bytes) -> tuple:
     for config in essais:
         try:
             if config is not None:
-                resp = client.models.generate_content(model=modele, contents=[base_im, EDIT_PROMPT], config=config)
+                resp = client.models.generate_content(model=modele, contents=[base_im, demande], config=config)
             else:
-                resp = client.models.generate_content(model=modele, contents=[base_im, EDIT_PROMPT])
+                resp = client.models.generate_content(model=modele, contents=[base_im, demande])
             image = _image_de_la_reponse(resp)
             if image is not None:
                 return _pil_to_webp_square_bytes(image, size=(2000, 2000), quality=88), True, ""
@@ -3080,63 +3103,7 @@ def treat_left_item_images(item_name: str, max_images: int = 10, preserve_order:
             # NON marquée traitée : elle n'est pas envoyée au site et sera retentée à la prochaine synchronisation.
             echecs.append(raison)
             continue
-        ext = ".jpg"
-
-        # create NEW treated file attached to same item
-        new_name = f"{it.name}_{str(i)}{ext}"
-        new_doc = save_file(
-            fname=new_name,
-            content=new_bytes,
-            dt="Item",
-            dn=it.name,
-            is_private=int(old_doc.is_private or 0),
-        )
-
-        # keep same attached_to_field (important for main image file)
-        if getattr(old_doc, "attached_to_field", None):
-            new_doc.attached_to_field = old_doc.attached_to_field
-            new_doc.save(ignore_permissions=True)
-
-        # if old one was the 'image' field, update item.image to new url
-        # (ou si c'est l'image principale reconnue à son adresse : sinon la fiche pointait sur le fichier détaché)
-        if getattr(old_doc, "attached_to_field", None) == "image" or (
-                image_principale and (old_doc.file_url or "").strip() == image_principale):
-            it.image = new_doc.file_url
-            # Le fichier porte le champ « image » : sinon Frappe, à l'enregistrement de la fiche, crée une deuxième
-            # fiche Fichier pour la même adresse — non traitée, donc retouchée une seconde fois au passage suivant.
-            if getattr(new_doc, "attached_to_field", None) != "image":
-                new_doc.attached_to_field = "image"
-
-        # copy WP fields if you already set them on old file
-        for fld in ("custom_wp_title", "custom_wp_alternative"):
-            if hasattr(old_doc, fld) and hasattr(new_doc, fld):
-                if not (getattr(new_doc, fld, "") or "").strip():
-                    val = (getattr(old_doc, fld, "") or "").strip()
-                    if val:
-                        setattr(new_doc, fld, val)
-
-        # mark new treated flag (on new file)
-        if hasattr(new_doc, "custom_treated_ai"):
-            new_doc.custom_treated_ai = 1
-        new_doc.save(ignore_permissions=True)
-
-        # OPTIONAL: keep ordering slot by copying creation timestamp
-        if int(preserve_order):
-            frappe.db.sql(
-                "UPDATE `tabFile` SET creation=%s WHERE name=%s",
-                (old_doc.creation, new_doc.name),
-            )
-
-        # detach the OLD file from item (only unlink)
-        _detach_file_doc(old_id)
-
-        actions.append({
-            "old_file": old_id,
-            "new_file": new_doc.name,
-            "old_url": old_doc.file_url,
-            "new_url": new_doc.file_url,
-            "field": getattr(old_doc, "attached_to_field", None),
-        })
+        actions.append(_remplacer_par_retouche(it, old_doc, new_bytes, i, image_principale, int(preserve_order)))
 
     it.save(ignore_permissions=True)
     frappe.db.commit()
@@ -3148,6 +3115,119 @@ def treat_left_item_images(item_name: str, max_images: int = 10, preserve_order:
                       "prochaine synchronisation." % (len(echecs), echecs[0]))
 
     return {"ok": True, "item": it.name, "treated_count": len(actions), "actions": actions,
+            "failed_count": len(echecs), "failed_reasons": sorted(set(echecs))}
+
+
+def _remplacer_par_retouche(it, old_doc, new_bytes: bytes, rang: int, image_principale: str = "", preserve_order: int = 1) -> dict:
+    """L'image retouchée prend la place de l'ancienne sur l'article : nouveau fichier marqué « traité », mêmes titre
+    et texte alternatif, même place dans la liste, image principale suivie ; l'ancien fichier est détaché (son image
+    sur le site sera supprimée à la synchronisation suivante). `it` est modifié, à l'appelant de l'enregistrer."""
+    old_id = old_doc.name
+    ext = ".jpg"
+
+    # create NEW treated file attached to same item
+    new_name = f"{it.name}_{str(rang)}{ext}"
+    new_doc = save_file(
+        fname=new_name,
+        content=new_bytes,
+        dt="Item",
+        dn=it.name,
+        is_private=int(old_doc.is_private or 0),
+    )
+
+    # keep same attached_to_field (important for main image file)
+    if getattr(old_doc, "attached_to_field", None):
+        new_doc.attached_to_field = old_doc.attached_to_field
+        new_doc.save(ignore_permissions=True)
+
+    # if old one was the 'image' field, update item.image to new url
+    # (ou si c'est l'image principale reconnue à son adresse : sinon la fiche pointait sur le fichier détaché)
+    if getattr(old_doc, "attached_to_field", None) == "image" or (
+            image_principale and (old_doc.file_url or "").strip() == image_principale):
+        it.image = new_doc.file_url
+        # Le fichier porte le champ « image » : sinon Frappe, à l'enregistrement de la fiche, crée une deuxième
+        # fiche Fichier pour la même adresse — non traitée, donc retouchée une seconde fois au passage suivant.
+        if getattr(new_doc, "attached_to_field", None) != "image":
+            new_doc.attached_to_field = "image"
+
+    # copy WP fields if you already set them on old file
+    for fld in ("custom_wp_title", "custom_wp_alternative"):
+        if hasattr(old_doc, fld) and hasattr(new_doc, fld):
+            if not (getattr(new_doc, fld, "") or "").strip():
+                val = (getattr(old_doc, fld, "") or "").strip()
+                if val:
+                    setattr(new_doc, fld, val)
+
+    # mark new treated flag (on new file)
+    if hasattr(new_doc, "custom_treated_ai"):
+        new_doc.custom_treated_ai = 1
+    new_doc.save(ignore_permissions=True)
+
+    # OPTIONAL: keep ordering slot by copying creation timestamp
+    if int(preserve_order):
+        frappe.db.sql(
+            "UPDATE `tabFile` SET creation=%s WHERE name=%s",
+            (old_doc.creation, new_doc.name),
+        )
+
+    # detach the OLD file from item (only unlink)
+    _detach_file_doc(old_id)
+
+    return {
+        "old_file": old_id,
+        "new_file": new_doc.name,
+        "old_url": old_doc.file_url,
+        "new_url": new_doc.file_url,
+        "field": getattr(old_doc, "attached_to_field", None),
+    }
+
+
+def images_de_l_article(item_name: str) -> list:
+    """Les images jointes à l'article, l'image principale d'abord : pour la fenêtre de retouche manuelle."""
+    it = frappe.get_doc("Item", item_name)
+    rows = frappe.get_all(
+        "File", filters={"attached_to_doctype": "Item", "attached_to_name": it.name, "is_folder": 0},
+        fields=["name", "file_url", "file_name", "is_private", "creation", "attached_to_field", "custom_treated_ai"],
+        order_by="is_private asc, creation asc", limit_page_length=500)
+    rows = [r for r in rows if _is_image_url(r.get("file_url"), r.get("file_name"))]
+    vues, uniques = set(), []
+    for r in (_make_main_first(it, rows) if rows else []):
+        if r["file_url"] in vues:
+            continue            # une fiche Fichier en double (même adresse) ne se propose qu'une fois
+        vues.add(r["file_url"])
+        uniques.append({"name": r["name"], "file_url": r["file_url"], "file_name": r["file_name"],
+                        "traitee": int(r.get("custom_treated_ai") or 0),
+                        "principale": int(r.get("attached_to_field") == "image" or (r["file_url"] or "").strip() == (it.image or "").strip())})
+    return uniques
+
+
+def retraiter_images(item_name: str, fichiers: list, consigne: str | None = None) -> dict:
+    """Retouche manuelle : les images choisies repassent à l'IA, traitées ou non, avec la consigne de l'utilisateur.
+
+    Le passage automatique, lui, ne retouche jamais une image déjà marquée « traitée » (treat_left_item_images)."""
+    it = frappe.get_doc("Item", item_name)
+    gemini_client = _get_gemini_client()
+    image_principale = (it.image or "").strip()
+    actions, echecs = [], []
+    for i, nom in enumerate(fichiers, start=1):
+        suivi.etape("retouche", "image %d sur %d" % (i, len(fichiers)))
+        old_doc = frappe.get_doc("File", nom)
+        if old_doc.attached_to_doctype != "Item" or old_doc.attached_to_name != it.name:
+            echecs.append("une image n’appartient pas à cet article")
+            continue
+        new_bytes, retouchee, raison = _gemini_retoucher(gemini_client, old_doc.get_content(), consigne)
+        if not retouchee:
+            echecs.append(raison)            # l'image reste en place, telle qu'elle était
+            continue
+        actions.append(_remplacer_par_retouche(it, old_doc, new_bytes, i, image_principale))
+    it.save(ignore_permissions=True)
+    frappe.db.commit()
+    reparer_image_principale(item_name)
+    if actions:
+        suivi.noter("%d image(s) retouchée(s)%s" % (len(actions), " avec votre consigne" if (consigne or "").strip() else ""))
+    if echecs:
+        suivi.avertir("%d image(s) non retouchée(s) : %s. Elles restent telles qu’elles étaient." % (len(echecs), echecs[0]))
+    return {"ok": not echecs, "item": it.name, "treated_count": len(actions), "actions": actions,
             "failed_count": len(echecs), "failed_reasons": sorted(set(echecs))}
 
 

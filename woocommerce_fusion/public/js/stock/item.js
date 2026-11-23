@@ -15,8 +15,8 @@ frappe.ui.form.on('Item', {
 			frm.trigger("sync_item");
 		}, __('Actions'));
 
-		// Refaire la retouche de toutes les images (après une retouche ratée ou un changement de consigne)
-		frm.add_custom_button(__("Refaire la retouche des images et synchroniser"), function () {
+		// Retouche manuelle : repasser à l'IA les images choisies, traitées ou non, avec une consigne
+		frm.add_custom_button(__("Retoucher des images avec l’IA…"), function () {
 			frm.trigger("sync_item_images");
 		}, __('Actions'));
 
@@ -78,14 +78,11 @@ frappe.ui.form.on('Item', {
 
 	sync_item: function(frm) {
 		// Synchronisation complète : en tâche de fond, avec son avancement sur la fiche (wcf_synchro plus bas).
-		wcf_synchro.lancer(frm, 0);
+		wcf_synchro.lancer(frm);
 	},
 
 	sync_item_images: function(frm) {
-		frappe.confirm(
-			__("Toutes les images de cet article repassent à la retouche, même celles déjà traitées, puis l’article est synchronisé avec le site. Continuer ?"),
-			() => wcf_synchro.lancer(frm, 1)
-		);
+		wcf_synchro.fenetre_retouche(frm);
 	},
 })
 
@@ -126,9 +123,10 @@ const wcf_synchro = {
 		const resume = e.resume || [];
 		if (this.en_cours(e)) {
 			const detail = e.detail ? " (" + e.detail + ")" : "";
+			const quoi = e.titre || __("Synchronisation avec le site");
 			const titre = e.etat === "attente"
-				? "🔄 " + __("Synchronisation avec le site : en file d’attente")
-				: "🔄 " + __("Synchronisation avec le site") + " — " + __("étape") + " " + e.rang + " " + __("sur") + " " + e.total
+				? "🔄 " + quoi + " : " + __("en file d’attente")
+				: "🔄 " + quoi + " — " + __("étape") + " " + e.rang + " " + __("sur") + " " + e.total
 					+ " : " + e.libelle + detail;
 			return { genre: "cours", titre, lignes: avert.map((a) => "⚠️ " + a),
 				barre: e.total ? Math.round(100 * Math.max(0, (e.rang || 0) - 0.5) / e.total) : 5,
@@ -137,13 +135,13 @@ const wcf_synchro = {
 		if (!e.fin || sec(e.fin, maintenant) > this.GARDER_H * 3600) return null;
 		const heure = String(e.fin).substring(11, 16);
 		if (e.etat === "echec") {
-			return { genre: "echec", titre: "❌ " + __("La synchronisation avec le site a échoué") + " (" + heure + ")"
+			return { genre: "echec", titre: "❌ " + (e.rate || __("La synchronisation avec le site a échoué")) + " (" + heure + ")"
 				+ (e.libelle ? " — " + __("étape") + " « " + e.libelle + " »" : ""),
 				lignes: [e.message || __("Cause inconnue : voir le journal des erreurs.")].concat(avert.map((a) => "⚠️ " + a)) };
 		}
 		return { genre: avert.length ? "attention" : "ok",
-			titre: (avert.length ? "⚠️ " + __("Synchronisé avec le site à") + " " + heure + " — " + avert.length + " " + __("point(s) à voir")
-				: "✅ " + __("Synchronisé avec le site à") + " " + heure) + (e.debut ? " (" + this.duree(sec(e.debut, e.fin)) + ")" : ""),
+			titre: (avert.length ? "⚠️ " + (e.fait || __("Synchronisé avec le site")) + " " + __("à") + " " + heure + " — " + avert.length + " " + __("point(s) à voir")
+				: "✅ " + (e.fait || __("Synchronisé avec le site")) + " " + __("à") + " " + heure) + (e.debut ? " (" + this.duree(sec(e.debut, e.fin)) + ")" : ""),
 			lignes: avert.map((a) => "⚠️ " + a).concat(resume.length ? ["✓ " + resume.join(" · ")] : []) };
 	},
 
@@ -183,7 +181,8 @@ const wcf_synchro = {
 				<div style="height:100%;width:${vue.barre}%;background:#2563eb;border-radius:999px;transition:width .6s"></div></div>
 				<div style="margin-top:6px;opacity:.85">${__("Vous pouvez continuer à travailler : la synchronisation se poursuit en arrière-plan.")}</div>` : ""}
 			${(vue.lignes || []).map((l) => `<div style="margin-top:4px">${esc(l)}</div>`).join("")}`).show();
-		$b.find('[data-wcf="relancer"]').on("click", () => this.lancer(frm, 0));
+		// une retouche ne se rejoue pas telle quelle (les images ont été remplacées) : on rouvre la fenêtre de choix
+		$b.find('[data-wcf="relancer"]').on("click", () => (e.genre === "retouche" ? this.fenetre_retouche(frm) : this.lancer(frm)));
 		$b.find('[data-wcf="masquer"]').on("click", () => { frm._wcf_masque = e.fin; $b.hide(); });
 	},
 
@@ -215,24 +214,84 @@ const wcf_synchro = {
 			}, this.RELIRE_MS);
 		} else if (e && this.en_cours(avant) && avant.item === e.item) {
 			// vient de se terminer sous nos yeux : on le dit, et on recharge la fiche (nouveaux textes, nouvelles images)
-			frappe.show_alert({ message: e.etat === "echec" ? __("La synchronisation avec le site a échoué")
-				: __("Synchronisation avec le site terminée"), indicator: e.etat === "echec" ? "red" : "green" }, 7);
+			frappe.show_alert({ message: e.etat === "echec" ? (e.rate || __("La synchronisation avec le site a échoué"))
+				: (e.fait || __("Synchronisé avec le site")), indicator: e.etat === "echec" ? "red" : "green" }, 7);
 			if (!frm.is_dirty()) frm.reload_doc();
 		}
 	},
 
-	lancer(frm, refaire_images) {
-		const partir = () => frappe.call({
-			method: this.METHODE + "lancer", args: { item_code: frm.doc.name, refaire_images: refaire_images ? 1 : 0 },
-		}).then((r) => {
-			const e = r.message || {};
-			frm._wcf_masque = null;
-			if (e.deja) frappe.show_alert({ message: __("Une synchronisation est déjà en cours pour cet article."), indicator: "orange" }, 5);
-			this.recevoir(frm, e);
+	/** Une fois la tâche mise en file : le bandeau prend le relais. */
+	parti(frm, e) {
+		e = e || {};
+		frm._wcf_masque = null;
+		if (e.deja) frappe.show_alert({ message: __("Un traitement est déjà en cours pour cet article."), indicator: "orange" }, 5);
+		this.recevoir(frm, e);
+	},
+
+	/** La tâche de fond lit la fiche ENREGISTRÉE : une case cochée mais pas encore enregistrée serait ignorée. */
+	enregistrer_puis(frm, suite) {
+		if (frm.is_dirty()) frm.save().then(suite);
+		else suite();
+	},
+
+	lancer(frm) {
+		this.enregistrer_puis(frm, () => frappe.call({ method: this.METHODE + "lancer", args: { item_code: frm.doc.name } })
+			.then((r) => this.parti(frm, r.message)));
+	},
+
+	/**
+	 * Retouche manuelle (demande du 23/11/2026 : « lorsque c'est traité par l'IA on ne la retraite plus, mais si elle
+	 * est traitée on peut la retraiter, une image, en ajoutant une consigne »). Le passage automatique ne touche
+	 * jamais une image déjà traitée ; ici l'utilisateur choisit les images, écrit ce qu'il veut, et les relance.
+	 */
+	fenetre_retouche(frm) {
+		const esc = frappe.utils.escape_html;
+		frappe.call({ method: this.METHODE + "images", args: { item_code: frm.doc.name } }).then((r) => {
+			const images = r.message || [];
+			if (!images.length) {
+				frappe.msgprint(__("Cet article n’a aucune image jointe."));
+				return;
+			}
+			const d = new frappe.ui.Dialog({
+				title: __("Retoucher des images avec l’IA"),
+				size: "large",
+				fields: [
+					{ fieldtype: "HTML", fieldname: "choix" },
+					{ fieldtype: "Small Text", fieldname: "consigne", label: __("Votre consigne pour ces images (facultatif)"),
+						description: __("Exemples : « garde les cotes et agrandis-les », « enlève le reflet sur le capot », « montre le produit de face », « garde le fond d’origine ». Sans consigne, la retouche habituelle est refaite.") },
+					{ fieldtype: "Check", fieldname: "synchroniser", label: __("Puis envoyer l’article sur le site"), default: 1 },
+				],
+				primary_action_label: __("Retoucher"),
+				primary_action: (v) => {
+					const fichiers = d.$wrapper.find("[data-wcf-image]:checked").map((i, el) => $(el).attr("data-wcf-image")).get();
+					if (!fichiers.length) {
+						frappe.show_alert({ message: __("Cochez au moins une image."), indicator: "orange" }, 4);
+						return;
+					}
+					d.hide();
+					this.enregistrer_puis(frm, () => frappe.call({
+						method: this.METHODE + "lancer_retouche",
+						args: { item_code: frm.doc.name, fichiers: fichiers, consigne: v.consigne || "", synchroniser: v.synchroniser ? 1 : 0 },
+					}).then((r2) => this.parti(frm, r2.message)));
+				},
+			});
+			d.fields_dict.choix.$wrapper.html(`
+				<div style="margin-bottom:8px;color:var(--text-muted)">${__("Cochez les images à repasser à l’IA. Une image déjà traitée n’est jamais retouchée toute seule : c’est ici qu’on la relance.")}</div>
+				<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px">
+				${images.map((im) => `
+					<label style="border:1px solid var(--border-color);border-radius:10px;padding:8px;cursor:pointer;display:block;margin:0">
+						<div style="height:130px;display:flex;align-items:center;justify-content:center;background:#fff;border-radius:6px;overflow:hidden">
+							<img src="${esc(im.file_url)}" style="max-width:100%;max-height:130px" loading="lazy">
+						</div>
+						<div style="display:flex;align-items:center;gap:6px;margin-top:6px">
+							<input type="checkbox" data-wcf-image="${esc(im.name)}" style="margin:0">
+							<span style="font-size:11.5px;font-weight:600;color:${im.traitee ? "#166534" : "#9a3412"}">${im.traitee ? "✓ " + __("traitée par l’IA") : __("pas encore traitée")}</span>
+						</div>
+						${im.principale ? `<div style="font-size:11px;color:var(--text-muted)">${__("image principale")}</div>` : ""}
+					</label>`).join("")}
+				</div>`);
+			d.show();
 		});
-		// La tâche de fond lit la fiche ENREGISTRÉE : une case cochée mais pas encore enregistrée serait ignorée.
-		if (frm.is_dirty()) frm.save().then(partir);
-		else partir();
 	},
 };
 window.wcf_synchro = wcf_synchro;

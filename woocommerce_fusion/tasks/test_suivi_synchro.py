@@ -44,9 +44,15 @@ class TestEtapes(unittest.TestCase):
 		self.assertEqual(S.etapes_prevues({"custom_generate_tag": 1})[:2], ["site", "classement"])
 		self.assertNotIn("classement", S.etapes_prevues({"custom_generate_tag": 1, "variant_of": "Modele"}))
 
-	def test_refaire_les_images_sans_seo(self):
-		self.assertEqual(S.etapes_prevues({}, refaire_images=True), ["images", "site", "fiche", "images_site", "finitions"])
-		self.assertEqual(S.etapes_prevues({"custom_generate_seo": 1}, refaire_images=True).count("images"), 1)
+	def test_retouche_manuelle_puis_synchronisation(self):
+		self.assertEqual(S.etapes_retouche({}, synchroniser=True), ["retouche", "site", "fiche", "images_site", "finitions"])
+		self.assertEqual(S.etapes_retouche({}, synchroniser=False), ["retouche"])
+		# « Générer SEO » coché : la synchronisation retouche ensuite les images NON traitées, c'est une autre étape
+		self.assertEqual(S.etapes_retouche({"custom_generate_seo": 1}, True)[:4], ["retouche", "site", "textes", "images"])
+
+	def test_le_bandeau_dit_ce_qui_a_ete_lance(self):
+		self.assertEqual(S.LIBELLES["retouche"]["fait"], "Images retouchées")
+		self.assertEqual(S.LIBELLES["synchro"]["titre"], "Synchronisation avec le site")
 
 	def test_avancer_donne_le_rang(self):
 		e = {"item": "A", "etapes": ["textes", "images", "fiche", "images_site", "finitions"]}
@@ -180,6 +186,34 @@ class TestRetouche(unittest.TestCase):
 		self.assertIn("quota", C.raison_echec_retouche("429 RESOURCE_EXHAUSTED"))
 		self.assertEqual(C.raison_echec_retouche("Connexion coupée\nsuite"), "Connexion coupée")
 
+	def test_sans_consigne_la_consigne_generale(self):
+		self.assertEqual(C.consigne_complete(None), C.EDIT_PROMPT)
+		self.assertEqual(C.consigne_complete("   "), C.EDIT_PROMPT)
+
+	def test_la_consigne_de_l_utilisateur_s_ajoute(self):
+		p = C.consigne_complete("  enlève le reflet\n sur le capot  ")
+		self.assertTrue(p.startswith(C.EDIT_PROMPT))
+		self.assertIn('"""enlève le reflet sur le capot"""', p)
+		self.assertIn("It has priority over the framing, background and lighting rules", p)
+		self.assertIn("nor to remove or alter any dimension, number or label", p)          # les cotes restent protégées
+		self.assertLessEqual(len(C.consigne_complete("x" * 5000)) - len(C.EDIT_PROMPT), C.CONSIGNE_MAX + 500)
+
+	def test_la_consigne_part_avec_l_image(self):
+		client = mock.Mock()
+		client.models.generate_content.return_value = _Reponse(_image())
+		with mock.patch.object(C, "_read_gemini_model", return_value="modele"):
+			C._gemini_retoucher(client, _image(), "montre le produit de face")
+		demande = client.models.generate_content.call_args.kwargs["contents"][1]
+		self.assertIn("montre le produit de face", demande)
+
+	def test_le_passage_automatique_ne_retraite_jamais_une_image_traitee(self):
+		"""« Lorsque c'est traité par l'IA on ne la retraite plus » : seule la retouche manuelle y revient."""
+		import inspect
+		source = inspect.getsource(C.treat_left_item_images)
+		self.assertIn("if treated == 1:\n            continue", source)
+		self.assertNotIn("consigne", source)
+		self.assertIn("_gemini_retoucher(gemini_client, old_doc.get_content(), consigne)", inspect.getsource(C.retraiter_images))
+
 	def test_l_ancienne_entree_rend_toujours_des_octets(self):
 		with mock.patch.object(C, "_gemini_retoucher", return_value=(b"x", False, "raison")):
 			self.assertEqual(C._gemini_edit_image_bytes(None, b""), b"x")
@@ -216,6 +250,8 @@ class TestFicheEtDependances(unittest.TestCase):
 		self.assertIn('METHODE: "woocommerce_fusion.tasks.suivi_synchro."', js)
 		self.assertNotIn("woocommerce_fusion.tasks.sync_items.run_item_sync", js)      # plus d'appel direct, écran gelé
 		self.assertIn("wcf_synchro.suivre(frm)", js)
+		self.assertIn('this.METHODE + "lancer_retouche"', js)                       # la retouche manuelle avec consigne
+		self.assertIn("fieldname: \"consigne\"", js)
 
 	def test_bibliotheque_google_bornee(self):
 		"""Sans borne, chaque reconstruction de la prod prenait la dernière version majeure."""

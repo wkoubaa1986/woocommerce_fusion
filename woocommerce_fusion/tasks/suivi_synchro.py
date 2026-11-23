@@ -15,6 +15,12 @@ Principe :
 
 Hors d'une synchronisation lancée par `lancer` (synchro de masse, tâches planifiées), `etape` / `avertir` / `noter` ne
 font rien : le reste du code les appelle sans condition.
+
+Retouche manuelle d'images (même jour) : « lorsque c'est traité par l'IA on ne la retraite plus, mais si elle est
+traitée on peut la retraiter, une image, en ajoutant une consigne ». Le passage automatique ne touche jamais une image
+déjà traitée ; `lancer_retouche(item_code, fichiers, consigne)` (fenêtre « Retoucher des images avec l'IA » de la
+fiche) repasse à l'IA les images CHOISIES, traitées ou non, avec la consigne écrite par l'utilisateur, puis
+synchronise l'article si demandé. Même tâche de fond, même bandeau.
 """
 from __future__ import annotations
 
@@ -31,6 +37,7 @@ DUREE_JOB = 30 * 60
 # Les étapes, dans l'ordre où le code les fait (tasks/sync_items.py, integrations/content_enrichment.py).
 ETAPES = {
     "attente": "En file d’attente",
+    "retouche": "Retouche des images choisies",
     "site": "Lecture du produit sur le site",
     "classement": "Classement de l’article (groupe, collections)",
     "textes": "Textes du site et SEO",
@@ -43,15 +50,28 @@ EN_COURS = ("attente", "en_cours")
 
 
 # ── règles pures ─────────────────────────────────────────────────────────────
-def etapes_prevues(item: dict, refaire_images: bool = False) -> list[str]:
-    """Les étapes que CET article va traverser, d'après ses cases cochées."""
-    prevues = ["images", "site"] if (refaire_images and not cint(item.get("custom_generate_seo"))) else ["site"]
+def etapes_prevues(item: dict) -> list[str]:
+    """Les étapes que CET article va traverser pendant une synchronisation, d'après ses cases cochées."""
+    prevues = ["site"]
     modele_ou_simple = not item.get("variant_of")
     if modele_ou_simple and (cint(item.get("custom_generate_classification")) or cint(item.get("custom_generate_tag"))):
         prevues.append("classement")
     if cint(item.get("custom_generate_seo")):
         prevues += ["textes", "images"]
     return prevues + ["fiche", "images_site", "finitions"]
+
+
+def etapes_retouche(item: dict, synchroniser: bool) -> list[str]:
+    """Retouche manuelle : les images choisies d'abord, puis la synchronisation si elle est demandée."""
+    return ["retouche"] + (etapes_prevues(item) if synchroniser else [])
+
+
+# Ce que le bandeau dit, selon ce qui a été lancé.
+LIBELLES = {
+    "synchro": {"titre": "Synchronisation avec le site", "fait": "Synchronisé avec le site",
+                "rate": "La synchronisation avec le site a échoué"},
+    "retouche": {"titre": "Retouche des images", "fait": "Images retouchées", "rate": "La retouche des images a échoué"},
+}
 
 
 def avancer(etat: dict, code: str, detail: str | None = None) -> dict:
@@ -153,39 +173,70 @@ def etat(item_code: str) -> dict | None:
     return e
 
 
-@frappe.whitelist()
-def lancer(item_code: str, refaire_images: int | str = 0) -> dict:
-    """Met la synchronisation de l'article dans la file et rend la main tout de suite.
-
-    `refaire_images` : repasse TOUTES les images de l'article à la retouche, même celles déjà traitées (utile après une
-    retouche ratée, ou après un changement de consigne)."""
+def _article(item_code: str) -> dict:
     frappe.has_permission("Item", "write", item_code, throw=True)
-    refaire_images = cint(refaire_images)
     item = frappe.db.get_value("Item", item_code, ["name", "variant_of", "custom_generate_classification", "custom_generate_tag",
                                                    "custom_generate_seo"], as_dict=True)
     if not item:
         frappe.throw(_("Article {0} introuvable.").format(item_code))
-    if not frappe.db.exists("Item WooCommerce Server", {"parent": item_code, "parenttype": "Item"}):
+    return item
+
+
+def _a_un_site(item_code: str) -> bool:
+    return bool(frappe.db.exists("Item WooCommerce Server", {"parent": item_code, "parenttype": "Item"}))
+
+
+def _mettre_en_file(item_code: str, genre: str, prevues: list, methode: str, **arguments) -> dict:
+    maintenant = str(now_datetime())
+    nouvel = _ecrire(dict({"item": item_code, "genre": genre, "etat": "attente", "etape": "attente", "libelle": ETAPES["attente"],
+                           "detail": "", "etapes": prevues, "rang": 0, "total": len(prevues), "debut": maintenant, "fin": None,
+                           "par": frappe.session.user, "avertissements": [], "resume": [], "message": ""}, **LIBELLES[genre]))
+    frappe.enqueue("woocommerce_fusion.tasks.suivi_synchro." + methode, queue="long", timeout=DUREE_JOB,
+                   job_id="wcf_synchro::" + item_code, deduplicate=True, enqueue_after_commit=True,
+                   item_code=item_code, **arguments)
+    return nouvel
+
+
+@frappe.whitelist()
+def lancer(item_code: str) -> dict:
+    """Met la synchronisation de l'article dans la file et rend la main tout de suite."""
+    item = _article(item_code)
+    if not _a_un_site(item_code):
         frappe.throw(_("Aucun site WooCommerce n’est défini sur l’article {0}.").format(item_code))
     actuel = etat(item_code)
     if actuel and actuel.get("etat") in EN_COURS:
         return dict(actuel, deja=1)
-    maintenant = str(now_datetime())
-    prevues = etapes_prevues(item, bool(refaire_images))
-    nouvel = _ecrire({"item": item_code, "etat": "attente", "etape": "attente", "libelle": ETAPES["attente"], "detail": "",
-                      "etapes": prevues, "rang": 0, "total": len(prevues), "debut": maintenant, "fin": None,
-                      "par": frappe.session.user, "refaire_images": refaire_images, "avertissements": [], "resume": [],
-                      "message": ""})
-    frappe.enqueue("woocommerce_fusion.tasks.suivi_synchro.executer", queue="long", timeout=DUREE_JOB,
-                   job_id="wcf_synchro::" + item_code, deduplicate=True, enqueue_after_commit=True,
-                   item_code=item_code, refaire_images=refaire_images)
-    return nouvel
+    return _mettre_en_file(item_code, "synchro", etapes_prevues(item), "executer")
+
+
+@frappe.whitelist()
+def images(item_code: str) -> list:
+    """Les images de l'article, pour la fenêtre de retouche manuelle : adresse, traitée ou non, principale ou non."""
+    frappe.has_permission("Item", "read", item_code, throw=True)
+    from woocommerce_fusion.integrations.content_enrichment import images_de_l_article
+    return images_de_l_article(item_code)
+
+
+@frappe.whitelist()
+def lancer_retouche(item_code: str, fichiers, consigne: str | None = None, synchroniser: int | str = 1) -> dict:
+    """Retouche manuelle : les images choisies repassent à l'IA (traitées ou non) avec la consigne de l'utilisateur,
+    puis l'article est synchronisé avec le site si `synchroniser`."""
+    item = _article(item_code)
+    fichiers = frappe.parse_json(fichiers) if isinstance(fichiers, str) else list(fichiers or [])
+    connues = {i["name"] for i in images(item_code)}
+    fichiers = [f for f in fichiers if f in connues]
+    if not fichiers:
+        frappe.throw(_("Choisissez au moins une image de cet article."))
+    synchroniser = cint(synchroniser) and _a_un_site(item_code)
+    actuel = etat(item_code)
+    if actuel and actuel.get("etat") in EN_COURS:
+        return dict(actuel, deja=1)
+    return _mettre_en_file(item_code, "retouche", etapes_retouche(item, bool(synchroniser)), "executer_retouche",
+                           fichiers=fichiers, consigne=(consigne or "").strip(), synchroniser=cint(synchroniser))
 
 
 # ── le travail, dans la file ─────────────────────────────────────────────────
-def executer(item_code: str, refaire_images: int = 0) -> None:
-    from woocommerce_fusion.tasks.sync_items import run_item_sync
-
+def _travailler(item_code: str, travail) -> None:
     frappe.flags.wcf_suivi = item_code
     try:
         try:        # une image principale qui pointe sur un fichier disparu fait échouer chaque enregistrement
@@ -193,9 +244,7 @@ def executer(item_code: str, refaire_images: int = 0) -> None:
             reparer_image_principale(item_code)
         except Exception:
             frappe.log_error(title="Synchronisation manuelle : image principale", message=frappe.get_traceback())
-        if cint(refaire_images):
-            _refaire_les_images(item_code)
-        run_item_sync(item_code=item_code)
+        travail()
         frappe.db.commit()
         e = _lire(item_code) or {"item": item_code}
         e.update(etat="terminee", fin=str(now_datetime()), detail="", message="")
@@ -211,19 +260,18 @@ def executer(item_code: str, refaire_images: int = 0) -> None:
         frappe.flags.wcf_suivi = None
 
 
-def _refaire_les_images(item_code: str) -> None:
-    """Toutes les images de l'article repassent à la retouche. Si « Générer SEO » est coché, la synchronisation s'en
-    charge elle-même juste après (elle retouche tout ce qui n'est pas marqué traité)."""
-    from woocommerce_fusion.integrations import content_enrichment as C
+def executer(item_code: str) -> None:
+    from woocommerce_fusion.tasks.sync_items import run_item_sync
+    _travailler(item_code, lambda: run_item_sync(item_code=item_code))
 
-    if not frappe.db.has_column("File", "custom_treated_ai"):
-        return
-    frappe.db.sql("""update `tabFile` set custom_treated_ai = 0
-                     where attached_to_doctype = 'Item' and attached_to_name = %s and ifnull(is_folder, 0) = 0""", (item_code,))
-    frappe.db.commit()
-    if cint(frappe.db.get_value("Item", item_code, "custom_generate_seo")):
-        return
-    etape("images")
-    C.dedupe_item_images(item_name=item_code, dry_run=False, detach_missing=True)
-    C.treat_left_item_images(item_name=item_code)
-    C.reparer_image_principale(item_code)
+
+def executer_retouche(item_code: str, fichiers: list, consigne: str = "", synchroniser: int = 1) -> None:
+    from woocommerce_fusion.integrations.content_enrichment import retraiter_images
+    from woocommerce_fusion.tasks.sync_items import run_item_sync
+
+    def travail():
+        retraiter_images(item_code, fichiers, consigne)
+        if cint(synchroniser):
+            run_item_sync(item_code=item_code)
+
+    _travailler(item_code, travail)
