@@ -217,7 +217,7 @@ class ItemGroupClassifier:
                 {"role": "user", "content": [{"type": "text", "text": json.dumps(user_obj, ensure_ascii=False)}]},
             ],
         }
-        if not str(self.model).lower().startswith("gpt-5"):
+        if accepte_temperature(self.model):
             params["temperature"] = self.temperature
 
         res = self.client.chat.completions.create(**params)
@@ -607,7 +607,7 @@ class ItemGroupClassifier:
                 {"role": "user", "content": user_content},
             ],
         }
-        if not str(self.model).lower().startswith("gpt-5"):
+        if accepte_temperature(self.model):
             params["temperature"] = self.temperature
                 
 
@@ -869,7 +869,7 @@ def _extract_description_from_images(openai_client: OpenAI, model: str, images: 
             {"role": "user", "content": user_content},
         ],
     }
-    if not str(model).lower().startswith("gpt-5"):
+    if accepte_temperature(model):
         params["temperature"] = 0.01
     res = openai_client.chat.completions.create(**params)
 
@@ -1317,13 +1317,13 @@ def enrich_item_content_with_openai_search(
     # for u in images[:3]:
     #     user_content.append({"type": "image_url", "image_url": {"url": u, "detail": image_detail}})
     #     # Call LLM
-    model_key="gpt-5-mini"
+    model_key = modele_etape("keywords_model")
     params = {
         "model": model_key,
         "response_format": {"type": "json_object"},
         "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": user_content}],
     }
-    if not str(model_key).lower().startswith("gpt-5"):
+    if accepte_temperature(model_key):
         params["temperature"] = temperature
     resp = client.chat.completions.create(**params)
     content = resp.choices[0].message.content
@@ -1593,7 +1593,7 @@ def enrich_item_content_with_openai_search(
         "response_format": {"type": "json_object"},
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user_content}],
     }
-    if not str(model_seo).lower().startswith("gpt-5"):
+    if accepte_temperature(model_seo):
         params["temperature"] = temperature
 
     resp = client.chat.completions.create(**params)
@@ -1623,7 +1623,7 @@ def enrich_item_content_with_openai_search(
             slug = parent_it.custom_seo_slug
         if not meta_description:
             meta_description = parent_it.custom_seo_meta_description
-    weight = estimate_weight_and_delivery_class(client, 'gpt-5-mini', images,[it.name,short_desc,it.description])
+    weight = estimate_weight_and_delivery_class(client, modele_etape("logistics_model"), images,[it.name,short_desc,it.description])
  
     product_weight = (str(weight.get("weight_kg")) or "")
     volumineux = (int(weight.get("is_volumineux")) or 0)
@@ -1726,7 +1726,7 @@ def generate_brand_seo_minimal(
         "response_format": {"type": "json_object"},
         "messages": [{"role": "user", "content": prompt}],
     }
-    if not str(model).lower().startswith("gpt-5"):
+    if accepte_temperature(model):
         params["temperature"] = temperature
     resp = client.chat.completions.create(**params)
 
@@ -1811,7 +1811,7 @@ def generate_item_group_seo_minimal(
         "response_format": {"type": "json_object"},
         "messages": [{"role": "user", "content": prompt}],
     }
-    if not str(model).lower().startswith("gpt-5"):
+    if accepte_temperature(model):
         params["temperature"] = temperature
     resp = client.chat.completions.create(**params)
     content = resp.choices[0].message.content.strip()
@@ -1918,8 +1918,36 @@ def _get_openai_client() -> OpenAI:
     return OpenAI(api_key=api_key)
 
 
+def accepte_temperature(model_name: str) -> bool:
+    """Seuls les anciens modèles (gpt-4o, gpt-4.1, gpt-3.5) acceptent une température choisie. Pure.
+
+    Les modèles à raisonnement — gpt-5 mini / nano, et toute la gamme gpt-6 (Sol, Terra, Luna, Astra) — la refusent
+    (« Only the default (1) value is supported », vérifié le 23/11/2026) : on ne l'envoie donc qu'aux anciens."""
+    return str(model_name or "").strip().lower().startswith(("gpt-4", "gpt-3"))
+
+
 def _is_gpt5(model_name: str) -> bool:
-    return str(model_name or "").lower().startswith("gpt-5")
+    """Ancien nom, gardé pour ses appelants : « ce modèle refuse la température »."""
+    return not accepte_temperature(model_name)
+
+
+# Un modèle par étape (23/11/2026 : « remets tout en setting »). Champ d'AI Settings -> modèle utilisé si le champ est
+# vide. Avant, trois de ces modèles étaient écrits en dur dans le code.
+MODELES_PAR_ETAPE = {
+    "web_search_model": "gpt-4.1-mini",        # recherche des caractéristiques sur internet (Responses API + web_search)
+    "keywords_model": "gpt-5-mini",            # choix des mots-clés
+    "logistics_model": "gpt-5-mini",           # poids et classe de livraison
+    "alt_model": "gpt-4o-mini",                # texte alternatif des images
+}
+
+
+def modele_etape(champ: str) -> str:
+    """Le modèle réglé dans AI Settings pour cette étape, sinon celui d'avant."""
+    try:
+        regle = (_read_ai_setting(champ) or "").strip()
+    except Exception:
+        regle = ""
+    return regle or MODELES_PAR_ETAPE[champ]
 
 
 # ---------------------------------------------------------------------------
@@ -2085,7 +2113,7 @@ def _openai_generate_alt_from_bytes(
     
     try:
         client = _get_openai_client()
-        model_name = "gpt-4o-mini"
+        model_name = modele_etape("alt_model")
         lang = "fr" if (locale or "").lower().startswith("fr") else "en"
 
         desc_short = re.sub(r"\s+", " ", description).strip()[:400] if description else ""
@@ -2281,6 +2309,8 @@ Goal: a clean, high-quality packshot of this EXACT product.
 - Keep the product strictly identical: shape, geometry, proportions, capacity, ports, flanges, thread types,
   handles, surface texture, colors, logos, labels, engravings, graduations and markings.
 - Do NOT invent, redesign, simplify, add or remove any part.
+- NEVER change the colors or the materials of the product: a grey tank stays grey, a black lid stays black.
+- NEVER add dimension lines, arrows, numbers, labels or any text that are not in the original photo.
 - Keep the SAME viewpoint and orientation as in the original photo.
 - Remove the background: pure white seamless studio background (#FFFFFF), no texture, no environment,
   no props, no people.
@@ -2297,8 +2327,10 @@ tables, legends or text that describes the product)
 Goal: the SAME image, cleaner and sharper. This information is essential for the customer.
 - Keep EVERY dimension line, arrow, number, unit, symbol, callout, label, table and text exactly as in the
   original: same values, same spelling, same language, same position.
-- NEVER remove, move, translate, round, retype or invent any of them.
+- NEVER remove, move, translate, round, retype or invent any of them. NEVER add a dimension, a number or a
+  label that is not in the original.
 - Do NOT change the viewpoint, the layout or the composition. Do NOT redraw the product from another angle.
+- Do NOT change the colors or the materials of the product.
 - Only: make the background pure white, remove noise and compression artifacts, sharpen the lines and the text
   so that every figure is perfectly legible, and increase the resolution.
 - Keep the whole image visible in a square 1:1 frame: add white margins instead of cropping.
@@ -2364,19 +2396,22 @@ def consigne_complete(consigne: str | None = None) -> str:
         '"""' + consigne.replace('"""', "'") + '"""\n'
         "Apply this instruction. It has priority over the framing, background and lighting rules above. "
         "It does not allow you to change the product itself, nor to remove or alter any dimension, number or label, "
-        "unless the instruction explicitly asks for it."
+        "unless the instruction explicitly asks for it. "
+        "If the instruction mentions something that does not exist in THIS image (for example dimensions, on a "
+        "photo that shows none), ignore that part of the instruction for this image: never draw it, never invent "
+        "values, never replace the product by another one."
     )
 
 
-def _gemini_retoucher(client: genai.Client, img_bytes: bytes, consigne: str | None = None) -> tuple:
-    """Retouche une image. Renvoie (octets WEBP carrés 2000×2000, réussie, raison de l'échec).
-    `consigne` : ce que l'utilisateur demande en plus pour cette image (retouche manuelle).
+def _retouche_pure(client, modele: str, demande: str, img_bytes: bytes) -> tuple:
+    """La retouche elle-même, SANS rien toucher de Frappe : elle peut tourner dans un fil d'exécution à part (plusieurs
+    images en même temps). Renvoie (octets WEBP carrés 2000×2000, réussie, raison de l'échec, à journaliser).
 
-    En cas d'échec, les octets sont l'image d'ORIGINE mise au carré : à l'appelant de décider quoi en faire — elle ne
-    doit pas être prise pour une image retouchée."""
+    En cas d'échec, les octets sont l'image d'ORIGINE mise au carré : elle ne doit pas être prise pour une retouche."""
+    import traceback
+
     base_im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    modele = _read_gemini_model(purpose="image")
-    demande = consigne_complete(consigne)
+    journal = []            # [(titre, texte)] : écrit dans le journal des erreurs par l'appelant
     derniere = None
     essais = [c for c in (_config_retouche(), None)]
     if essais[0] is None:
@@ -2389,23 +2424,30 @@ def _gemini_retoucher(client: genai.Client, img_bytes: bytes, consigne: str | No
                 resp = client.models.generate_content(model=modele, contents=[base_im, demande])
             image = _image_de_la_reponse(resp)
             if image is not None:
-                return _pil_to_webp_square_bytes(image, size=(2000, 2000), quality=88), True, ""
+                return _pil_to_webp_square_bytes(image, size=(2000, 2000), quality=88), True, "", journal
             # No image returned (refusal, safety block, text-only model...). Log why.
             finish = [getattr(c, "finish_reason", None) for c in (getattr(resp, "candidates", []) or [])]
             texts = [part.text for cand in (getattr(resp, "candidates", []) or [])
                      for part in (getattr(getattr(cand, "content", None), "parts", None) or []) if getattr(part, "text", None)]
-            frappe.log_error(
-                f"finish_reason={finish}\nprompt_feedback={getattr(resp, 'prompt_feedback', None)}\n"
-                f"text={' | '.join(texts)[:1000]}",
-                "gemini image edit: no image returned",
-            )
+            journal.append(("gemini image edit: no image returned",
+                            f"finish_reason={finish}\nprompt_feedback={getattr(resp, 'prompt_feedback', None)}\n"
+                            f"text={' | '.join(texts)[:1000]}"))
             derniere = "aucune image renvoyée"
         except Exception as e:
             derniere = str(e)
             if config is None or not ("400" in derniere or "INVALID_ARGUMENT" in derniere):
-                frappe.log_error(frappe.get_traceback(), "gemini image edit failed")
+                journal.append(("gemini image edit failed", traceback.format_exc()))
                 break            # un modèle introuvable ou une clé refusée ne passera pas mieux sans les options
-    return _pil_to_webp_square_bytes(base_im, size=(2000, 2000), quality=88), False, raison_echec_retouche(derniere)
+    return _pil_to_webp_square_bytes(base_im, size=(2000, 2000), quality=88), False, raison_echec_retouche(derniere), journal
+
+
+def _gemini_retoucher(client: genai.Client, img_bytes: bytes, consigne: str | None = None) -> tuple:
+    """Retouche une image. Renvoie (octets WEBP carrés 2000×2000, réussie, raison de l'échec).
+    `consigne` : ce que l'utilisateur demande en plus pour cette image (retouche manuelle)."""
+    octets, reussie, raison, journal = _retouche_pure(client, _read_gemini_model(purpose="image"), consigne_complete(consigne), img_bytes)
+    for titre, texte in journal:
+        frappe.log_error(texte, titre)
+    return octets, reussie, raison
 
 
 def _gemini_edit_image_bytes(client: genai.Client, img_bytes: bytes) -> bytes:
@@ -2925,7 +2967,7 @@ def generate_website_contenant(item_name: str) -> Dict[str, Any]:
     ENCODE_POLICY = "auto"
     IMAGE_DETAIL = "low"
     VISION_MODEL = ""               # fallback handled in enrich_... if empty
-    WEB_MODEL = "gpt-4.1-mini"
+    WEB_MODEL = modele_etape("web_search_model")
 
     # image retouch
     MAX_IMAGES_RETOUCH = 10
@@ -3172,6 +3214,9 @@ def _remplacer_par_retouche(it, old_doc, new_bytes: bytes, rang: int, image_prin
 
     # detach the OLD file from item (only unlink)
     _detach_file_doc(old_id)
+    # L'image d'avant reste retrouvable : « Revenir à l'image d'avant » dans la fenêtre de retouche.
+    if _has_db_column("File", CHAMP_IMAGE_AVANT):
+        frappe.db.set_value("File", new_doc.name, CHAMP_IMAGE_AVANT, old_id, update_modified=False)
 
     return {
         "old_file": old_id,
@@ -3180,6 +3225,41 @@ def _remplacer_par_retouche(it, old_doc, new_bytes: bytes, rang: int, image_prin
         "new_url": new_doc.file_url,
         "field": getattr(old_doc, "attached_to_field", None),
     }
+
+
+CHAMP_IMAGE_AVANT = "custom_image_avant"       # sur la fiche Fichier : le nom du fichier que celui-ci a remplacé
+RETOUCHES_EN_PARALLELE = 4
+
+
+def _fichier_present(url: str) -> bool:
+    from urllib.parse import unquote
+    url = unquote((url or "").strip())
+    if url.startswith("/files/"):
+        return os.path.isfile(frappe.get_site_path("public", url.lstrip("/")))
+    if url.startswith("/private/files/"):
+        return os.path.isfile(frappe.get_site_path(url.lstrip("/")))
+    return False
+
+
+def image_d_avant(nom_fichier: str):
+    """Le fichier que cette image a remplacé, s'il existe encore : {name, file_url} ou None.
+
+    Depuis le 23/11/2026 le remplacement l'écrit sur la fiche Fichier (CHAMP_IMAGE_AVANT). Pour les retouches d'avant,
+    repli : le remplacement recopie la date de création de l'ancien fichier sur le nouveau — un fichier détaché qui
+    porte exactement la même date de création est donc son prédécesseur."""
+    champs = ["creation"] + ([CHAMP_IMAGE_AVANT] if _has_db_column("File", CHAMP_IMAGE_AVANT) else [])
+    f = frappe.db.get_value("File", nom_fichier, champs, as_dict=True)
+    if not f:
+        return None
+    candidats = [f.get(CHAMP_IMAGE_AVANT)] if f.get(CHAMP_IMAGE_AVANT) else []
+    candidats += [r[0] for r in frappe.db.sql(
+        """select name from `tabFile` where creation = %s and name != %s and ifnull(attached_to_name, '') = ''
+           and ifnull(is_folder, 0) = 0 order by modified desc limit 3""", (f.creation, nom_fichier))]
+    for nom in candidats:
+        avant = frappe.db.get_value("File", nom, ["name", "file_url", "file_name"], as_dict=True)
+        if avant and _is_image_url(avant.file_url, avant.file_name) and _fichier_present(avant.file_url):
+            return {"name": avant.name, "file_url": avant.file_url}
+    return None
 
 
 def images_de_l_article(item_name: str) -> list:
@@ -3195,40 +3275,144 @@ def images_de_l_article(item_name: str) -> list:
         if r["file_url"] in vues:
             continue            # une fiche Fichier en double (même adresse) ne se propose qu'une fois
         vues.add(r["file_url"])
+        avant = image_d_avant(r["name"])
         uniques.append({"name": r["name"], "file_url": r["file_url"], "file_name": r["file_name"],
                         "traitee": int(r.get("custom_treated_ai") or 0),
-                        "principale": int(r.get("attached_to_field") == "image" or (r["file_url"] or "").strip() == (it.image or "").strip())})
+                        "principale": int(r.get("attached_to_field") == "image" or (r["file_url"] or "").strip() == (it.image or "").strip()),
+                        "avant_url": avant["file_url"] if avant else ""})
     return uniques
 
 
-def retraiter_images(item_name: str, fichiers: list, consigne: str | None = None) -> dict:
-    """Retouche manuelle : les images choisies repassent à l'IA, traitées ou non, avec la consigne de l'utilisateur.
+def proposer_retouches(item_name: str, fichiers: list, consignes: dict | None = None) -> tuple:
+    """Retouche manuelle, premier temps : les images choisies passent à l'IA (plusieurs en même temps) et le résultat
+    est mis de côté comme PROPOSITION — rien n'est remplacé, rien ne part sur le site.
 
-    Le passage automatique, lui, ne retouche jamais une image déjà marquée « traitée » (treat_left_item_images)."""
+    Demande du 23/11/2026, après une retouche fausse partie directement sur le site (des cotes inventées sur une photo
+    qui n'en avait pas, un appareil gris devenu blanc) : « comment je peux faire un contrôle avant ». L'utilisateur
+    voit l'avant / après et choisit image par image (`appliquer_retouches`).
+
+    `consignes` : {nom du fichier: consigne}. UNE consigne PAR image (« est-ce que je peux faire une consigne par
+    image ? ») : la consigne unique appliquée à toutes les images cochées est ce qui avait fait dessiner des cotes sur
+    une photo qui n'en avait pas. Une image sans consigne reçoit la retouche habituelle.
+
+    Renvoie (propositions, raisons des échecs)."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     it = frappe.get_doc("Item", item_name)
-    gemini_client = _get_gemini_client()
-    image_principale = (it.image or "").strip()
-    actions, echecs = [], []
-    for i, nom in enumerate(fichiers, start=1):
-        suivi.etape("retouche", "image %d sur %d" % (i, len(fichiers)))
-        old_doc = frappe.get_doc("File", nom)
-        if old_doc.attached_to_doctype != "Item" or old_doc.attached_to_name != it.name:
+    client = _get_gemini_client()
+    modele = _read_gemini_model(purpose="image")
+    consignes = consignes or {}
+    travaux, echecs = [], []
+    for nom in fichiers:
+        doc = frappe.get_doc("File", nom)
+        if doc.attached_to_doctype != "Item" or doc.attached_to_name != it.name:
             echecs.append("une image n’appartient pas à cet article")
             continue
-        new_bytes, retouchee, raison = _gemini_retoucher(gemini_client, old_doc.get_content(), consigne)
-        if not retouchee:
-            echecs.append(raison)            # l'image reste en place, telle qu'elle était
+        travaux.append((nom, doc.file_url, doc.get_content()))
+    resultats = {}
+    if travaux:
+        suivi.etape("retouche", "0 sur %d prête(s)" % len(travaux))
+        # Les appels à Google partent ensemble ; tout ce qui touche à la base reste dans ce fil-ci.
+        with ThreadPoolExecutor(max_workers=min(RETOUCHES_EN_PARALLELE, len(travaux))) as fils:
+            futurs = {fils.submit(_retouche_pure, client, modele, consigne_complete(consignes.get(nom)), octets): nom
+                      for nom, _url, octets in travaux}
+            for n, futur in enumerate(as_completed(futurs), start=1):
+                resultats[futurs[futur]] = futur.result()
+                suivi.etape("retouche", "%d sur %d prête(s)" % (n, len(travaux)))
+    propositions = []
+    for nom, url, _octets in travaux:
+        octets, reussie, raison, journal = resultats[nom]
+        for titre, texte in journal:
+            frappe.log_error(texte, titre)
+        if not reussie:
+            echecs.append(raison)
             continue
-        actions.append(_remplacer_par_retouche(it, old_doc, new_bytes, i, image_principale))
+        # Fiche Fichier créée directement, jointe à rien (dt=None, dn=None) : l'outil `save_file` écrit le fichier
+        # deux fois sous deux noms, et le second resterait sur le disque après un refus.
+        fiche = frappe.get_doc({"doctype": "File", "file_name": "proposition-%s-%s.webp" % (it.name, frappe.generate_hash(length=10)),
+                                "content": octets, "is_private": 0})
+        fiche.insert(ignore_permissions=True)
+        propositions.append({"ancien": nom, "ancien_url": url, "proposition": fiche.name, "proposition_url": fiche.file_url,
+                             "consigne": " ".join((consignes.get(nom) or "").split())[:CONSIGNE_MAX]})
+    frappe.db.commit()
+    return propositions, echecs
+
+
+def supprimer_propositions(propositions: list) -> None:
+    """Les propositions non gardées (ou abandonnées) : la fiche Fichier et son fichier disparaissent."""
+    for p in propositions or []:
+        try:
+            if frappe.db.exists("File", p.get("proposition")):
+                frappe.delete_doc("File", p["proposition"], ignore_permissions=True, force=True)
+            # Frappe laisse parfois le fichier sur le disque : une retouche refusée ne doit pas rester accessible.
+            url = (p.get("proposition_url") or "").strip()
+            if url.startswith("/files/proposition-") and not frappe.db.exists("File", {"file_url": url}):
+                chemin = frappe.get_site_path("public", url.lstrip("/"))
+                if os.path.isfile(chemin):
+                    os.remove(chemin)
+        except Exception:
+            frappe.log_error(title="Retouche : proposition non supprimée", message=frappe.get_traceback())
+
+
+def appliquer_retouches(item_name: str, propositions: list, gardees: list) -> dict:
+    """Retouche manuelle, second temps : les propositions que l'utilisateur a choisi de GARDER prennent la place de
+    l'ancienne image ; les autres sont supprimées, l'ancienne image reste."""
+    it = frappe.get_doc("Item", item_name)
+    image_principale = (it.image or "").strip()
+    actions = []
+    for i, p in enumerate(propositions or [], start=1):
+        if p.get("ancien") not in (gardees or []):
+            continue
+        suivi.etape("application", "image %d sur %d" % (len(actions) + 1, len(gardees)))
+        if not frappe.db.exists("File", p["ancien"]) or not frappe.db.exists("File", p["proposition"]):
+            suivi.avertir("Une image a changé entre-temps : sa retouche n’a pas été mise en place.")
+            continue
+        old_doc = frappe.get_doc("File", p["ancien"])
+        if old_doc.attached_to_doctype != "Item" or old_doc.attached_to_name != it.name:
+            suivi.avertir("Une image n’est plus jointe à l’article : sa retouche n’a pas été mise en place.")
+            continue
+        # ⚠️ La proposition est SUPPRIMÉE avant de créer le fichier définitif : Frappe ne garde qu'un fichier par
+        # contenu identique — sinon la nouvelle image pointait sur le fichier « proposition-… », effacé juste après.
+        octets = frappe.get_doc("File", p["proposition"]).get_content()
+        supprimer_propositions([p])
+        actions.append(_remplacer_par_retouche(it, old_doc, octets, i, image_principale))
+    it.save(ignore_permissions=True)
+    frappe.db.commit()
+    supprimer_propositions(propositions)
+    frappe.db.commit()
+    reparer_image_principale(item_name)
+    suivi.noter("%d retouche(s) gardée(s), %d refusée(s)" % (len(actions), len(propositions or []) - len(actions)))
+    return {"ok": True, "item": it.name, "treated_count": len(actions), "actions": actions}
+
+
+def restaurer_images(item_name: str, fichiers: list) -> dict:
+    """« Revenir à l'image d'avant » : l'image remplacée par une retouche reprend sa place, la retouche est détachée."""
+    it = frappe.get_doc("Item", item_name)
+    image_principale = (it.image or "").strip()
+    faites = 0
+    for i, nom in enumerate(fichiers or [], start=1):
+        suivi.etape("restauration", "image %d sur %d" % (i, len(fichiers)))
+        actuel = frappe.get_doc("File", nom)
+        if actuel.attached_to_doctype != "Item" or actuel.attached_to_name != it.name:
+            continue
+        avant = image_d_avant(nom)
+        if not avant:
+            suivi.avertir("Une image n’a pas d’image d’avant : elle reste telle quelle.")
+            continue
+        valeurs = {"attached_to_doctype": "Item", "attached_to_name": it.name, "attached_to_field": actuel.attached_to_field}
+        if _has_db_column("File", "custom_treated_ai"):
+            valeurs["custom_treated_ai"] = 1            # elle repart sur le site telle qu'elle était
+        frappe.db.set_value("File", avant["name"], valeurs, update_modified=True)
+        if actuel.attached_to_field == "image" or (actuel.file_url or "").strip() == image_principale:
+            it.image = avant["file_url"]
+            frappe.db.set_value("File", avant["name"], "attached_to_field", "image", update_modified=False)
+        _detach_file_doc(nom)
+        faites += 1
     it.save(ignore_permissions=True)
     frappe.db.commit()
     reparer_image_principale(item_name)
-    if actions:
-        suivi.noter("%d image(s) retouchée(s)%s" % (len(actions), " avec votre consigne" if (consigne or "").strip() else ""))
-    if echecs:
-        suivi.avertir("%d image(s) non retouchée(s) : %s. Elles restent telles qu’elles étaient." % (len(echecs), echecs[0]))
-    return {"ok": not echecs, "item": it.name, "treated_count": len(actions), "actions": actions,
-            "failed_count": len(echecs), "failed_reasons": sorted(set(echecs))}
+    suivi.noter("%d image(s) revenue(s) à leur version d’avant" % faites)
+    return {"ok": True, "item": it.name, "restored_count": faites}
 
 
 def reparer_image_principale(item_name: str):
@@ -3360,7 +3544,7 @@ def estimate_weight_and_delivery_class(
     }
 
     # keep deterministic for non gpt-5 models
-    if not str(model).lower().startswith("gpt-5"):
+    if accepte_temperature(model):
         params["temperature"] = 0.01
 
     res = openai_client.chat.completions.create(**params)

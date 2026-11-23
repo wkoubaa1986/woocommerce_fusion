@@ -132,6 +132,12 @@ const wcf_synchro = {
 				barre: e.total ? Math.round(100 * Math.max(0, (e.rang || 0) - 0.5) / e.total) : 5,
 				depuis: e.debut ? this.duree(sec(e.debut, maintenant)) : "" };
 		}
+		if (e.etat === "a_valider") {
+			const n = (e.propositions || []).length;
+			return { genre: "attention", a_valider: true,
+				titre: "🖼️ " + n + " " + __("retouche(s) prête(s) : à vérifier avant de les garder"),
+				lignes: [__("Rien n’a encore été remplacé, rien n’est parti sur le site.")].concat(avert.map((a) => "⚠️ " + a)) };
+		}
 		if (!e.fin || sec(e.fin, maintenant) > this.GARDER_H * 3600) return null;
 		const heure = String(e.fin).substring(11, 16);
 		if (e.etat === "echec") {
@@ -174,7 +180,8 @@ const wcf_synchro = {
 		$b.css({ background: couleurs[0], "border-color": couleurs[1], color: couleurs[2] }).html(`
 			<div style="display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap">
 				<div style="flex:1 1 260px;font-weight:700">${esc(vue.titre)}${vue.depuis ? ` <span style="font-weight:400;opacity:.8">· ${esc(vue.depuis)}</span>` : ""}</div>
-				${fini ? `<button class="btn btn-xs btn-default" data-wcf="relancer">${__("Relancer")}</button>
+				${vue.a_valider ? `<button class="btn btn-xs btn-primary" data-wcf="verifier">${__("Vérifier les retouches")}</button>`
+					: fini ? `<button class="btn btn-xs btn-default" data-wcf="relancer">${__("Relancer")}</button>
 					<button class="btn btn-xs btn-default" data-wcf="masquer">${__("Masquer")}</button>` : ""}
 			</div>
 			${vue.genre === "cours" ? `<div style="height:6px;background:#dbeafe;border-radius:999px;margin-top:8px;overflow:hidden">
@@ -182,7 +189,8 @@ const wcf_synchro = {
 				<div style="margin-top:6px;opacity:.85">${__("Vous pouvez continuer à travailler : la synchronisation se poursuit en arrière-plan.")}</div>` : ""}
 			${(vue.lignes || []).map((l) => `<div style="margin-top:4px">${esc(l)}</div>`).join("")}`).show();
 		// une retouche ne se rejoue pas telle quelle (les images ont été remplacées) : on rouvre la fenêtre de choix
-		$b.find('[data-wcf="relancer"]').on("click", () => (e.genre === "retouche" ? this.fenetre_retouche(frm) : this.lancer(frm)));
+		$b.find('[data-wcf="relancer"]').on("click", () => (e.genre === "synchro" || !e.genre ? this.lancer(frm) : this.fenetre_retouche(frm)));
+		$b.find('[data-wcf="verifier"]').on("click", () => this.fenetre_validation(frm, e));
 		$b.find('[data-wcf="masquer"]').on("click", () => { frm._wcf_masque = e.fin; $b.hide(); });
 	},
 
@@ -212,6 +220,8 @@ const wcf_synchro = {
 				if (window.cur_frm !== frm || frm.doc.name !== e.item || !frm.$wrapper.is(":visible")) return;
 				frappe.call({ method: this.METHODE + "etat", args: { item_code: e.item } }).then((r) => this.recevoir(frm, r.message));
 			}, this.RELIRE_MS);
+		} else if (e && e.etat === "a_valider" && this.en_cours(avant) && avant.item === e.item) {
+			this.fenetre_validation(frm, e);
 		} else if (e && this.en_cours(avant) && avant.item === e.item) {
 			// vient de se terminer sous nos yeux : on le dit, et on recharge la fiche (nouveaux textes, nouvelles images)
 			frappe.show_alert({ message: e.etat === "echec" ? (e.rate || __("La synchronisation avec le site a échoué"))
@@ -240,6 +250,53 @@ const wcf_synchro = {
 	},
 
 	/**
+	 * Contrôle avant (23/11/2026, après une retouche fausse partie directement sur le site) : chaque retouche est
+	 * montrée à côté de l'image actuelle ; rien n'est remplacé tant que l'utilisateur n'a pas coché « garder ».
+	 */
+	fenetre_validation(frm, e) {
+		const esc = frappe.utils.escape_html;
+		const props = e.propositions || [];
+		if (!props.length) return;
+		if (this._validation && this._validation.display) this._validation.hide();
+		const d = new frappe.ui.Dialog({
+			title: __("Vérifier les retouches avant de les garder"),
+			size: "extra-large",
+			fields: [{ fieldtype: "HTML", fieldname: "paires" }],
+			primary_action_label: __("Valider mon choix"),
+			primary_action: () => {
+				const gardees = d.$wrapper.find("[data-wcf-garder]:checked").map((i, el) => $(el).attr("data-wcf-garder")).get();
+				d.hide();
+				frappe.call({ method: this.METHODE + "valider_retouches", args: { item_code: frm.doc.name, gardees: gardees } })
+					.then((r) => this.parti(frm, r.message));
+			},
+			secondary_action_label: __("Plus tard"),
+			secondary_action: () => d.hide(),
+		});
+		const image = (url, legende) => `
+			<div style="flex:1 1 0;min-width:0">
+				<div style="font-size:11.5px;font-weight:700;color:var(--text-muted);margin-bottom:4px">${legende}</div>
+				<a href="${esc(url)}" target="_blank" title="${__("Ouvrir en grand")}">
+					<img src="${esc(url)}" style="width:100%;max-height:360px;object-fit:contain;border:1px solid var(--border-color);border-radius:8px;background:#fff" loading="lazy"></a>
+			</div>`;
+		d.fields_dict.paires.$wrapper.html(`
+			<div style="margin-bottom:10px">${__("Comparez chaque image. Cochez « Garder la retouche » seulement si elle est juste : mêmes cotes, même produit, mêmes couleurs. Une retouche non cochée est jetée, l’image actuelle reste.")}</div>
+			${props.map((p, i) => `
+				<div style="border:1px solid var(--border-color);border-radius:10px;padding:10px;margin-bottom:12px">
+					<div style="margin-bottom:8px;font-size:12.5px"><b>${__("Votre consigne")} :</b> ${p.consigne ? esc(p.consigne) : `<span style="color:var(--text-muted)">${__("aucune (retouche habituelle)")}</span>`}</div>
+					<div style="display:flex;gap:12px;align-items:flex-start">
+						${image(p.ancien_url, __("Image actuelle"))}
+						${image(p.proposition_url, __("Retouche proposée"))}
+					</div>
+					<label style="display:flex;align-items:center;gap:8px;margin:10px 0 0;font-weight:700;cursor:pointer">
+						<input type="checkbox" data-wcf-garder="${esc(p.ancien)}" style="margin:0"> ${__("Garder la retouche")} (${i + 1} / ${props.length})
+					</label>
+				</div>`).join("")}
+			<div style="color:var(--text-muted)">${e.synchroniser ? __("Après validation, l’article sera envoyé sur le site avec les retouches gardées.") : __("L’article ne sera pas envoyé sur le site.")}</div>`);
+		this._validation = d;
+		d.show();
+	},
+
+	/**
 	 * Retouche manuelle (demande du 23/11/2026 : « lorsque c'est traité par l'IA on ne la retraite plus, mais si elle
 	 * est traitée on peut la retraiter, une image, en ajoutant une consigne »). Le passage automatique ne touche
 	 * jamais une image déjà traitée ; ici l'utilisateur choisit les images, écrit ce qu'il veut, et les relance.
@@ -257,11 +314,23 @@ const wcf_synchro = {
 				size: "large",
 				fields: [
 					{ fieldtype: "HTML", fieldname: "choix" },
-					{ fieldtype: "Small Text", fieldname: "consigne", label: __("Votre consigne pour ces images (facultatif)"),
-						description: __("Exemples : « garde les cotes et agrandis-les », « enlève le reflet sur le capot », « montre le produit de face », « garde le fond d’origine ». Sans consigne, la retouche habituelle est refaite.") },
-					{ fieldtype: "Check", fieldname: "synchroniser", label: __("Puis envoyer l’article sur le site"), default: 1 },
+					{ fieldtype: "Check", fieldname: "synchroniser", label: __("Envoyer l’article sur le site une fois mon choix validé"), default: 1 },
 				],
-				primary_action_label: __("Retoucher"),
+				primary_action_label: __("Retoucher, puis me montrer le résultat"),
+				secondary_action_label: __("↩ Revenir à l’image d’avant"),
+				secondary_action: () => {
+					const cochees = d.$wrapper.find("[data-wcf-image]:checked");
+					const fichiers = cochees.filter("[data-wcf-avant='1']").map((i, el) => $(el).attr("data-wcf-image")).get();
+					if (!fichiers.length) {
+						frappe.show_alert({ message: __("Cochez une image qui a une version d’avant (marquée ↩)."), indicator: "orange" }, 5);
+						return;
+					}
+					const envoyer = d.get_value("synchroniser") ? 1 : 0;
+					d.hide();
+					this.enregistrer_puis(frm, () => frappe.call({
+						method: this.METHODE + "restaurer", args: { item_code: frm.doc.name, fichiers: fichiers, synchroniser: envoyer },
+					}).then((r2) => this.parti(frm, r2.message)));
+				},
 				primary_action: (v) => {
 					const fichiers = d.$wrapper.find("[data-wcf-image]:checked").map((i, el) => $(el).attr("data-wcf-image")).get();
 					if (!fichiers.length) {
@@ -269,26 +338,36 @@ const wcf_synchro = {
 						return;
 					}
 					d.hide();
+					const consignes = {};
+					fichiers.forEach((f) => {
+						const texte = (d.$wrapper.find(`[data-wcf-consigne="${f}"]`).val() || "").trim();
+						if (texte) consignes[f] = texte;
+					});
 					this.enregistrer_puis(frm, () => frappe.call({
 						method: this.METHODE + "lancer_retouche",
-						args: { item_code: frm.doc.name, fichiers: fichiers, consigne: v.consigne || "", synchroniser: v.synchroniser ? 1 : 0 },
+						args: { item_code: frm.doc.name, fichiers: fichiers, consignes: consignes, synchroniser: v.synchroniser ? 1 : 0 },
 					}).then((r2) => this.parti(frm, r2.message)));
 				},
 			});
 			d.fields_dict.choix.$wrapper.html(`
-				<div style="margin-bottom:8px;color:var(--text-muted)">${__("Cochez les images à repasser à l’IA. Une image déjà traitée n’est jamais retouchée toute seule : c’est ici qu’on la relance.")}</div>
-				<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px">
+				<div style="margin-bottom:8px;color:var(--text-muted)">${__("Cochez les images à repasser à l’IA et écrivez, si vous voulez, une consigne POUR CHAQUE image (exemples : « enlève le reflet sur le capot », « garde le fond d’origine », « écris les cotes en rouge »). Sans consigne, la retouche habituelle est refaite. Rien n’est remplacé tout de suite : vous verrez l’avant / après et vous choisirez.")}</div>
+				<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:10px">
 				${images.map((im) => `
-					<label style="border:1px solid var(--border-color);border-radius:10px;padding:8px;cursor:pointer;display:block;margin:0">
-						<div style="height:130px;display:flex;align-items:center;justify-content:center;background:#fff;border-radius:6px;overflow:hidden">
-							<img src="${esc(im.file_url)}" style="max-width:100%;max-height:130px" loading="lazy">
+					<div style="border:1px solid var(--border-color);border-radius:10px;padding:8px">
+						<label style="cursor:pointer;display:block;margin:0">
+						<div style="height:150px;display:flex;align-items:center;justify-content:center;background:#fff;border-radius:6px;overflow:hidden">
+							<img src="${esc(im.file_url)}" style="max-width:100%;max-height:150px" loading="lazy">
 						</div>
 						<div style="display:flex;align-items:center;gap:6px;margin-top:6px">
-							<input type="checkbox" data-wcf-image="${esc(im.name)}" style="margin:0">
+							<input type="checkbox" data-wcf-image="${esc(im.name)}" data-wcf-avant="${im.avant_url ? 1 : 0}" style="margin:0">
 							<span style="font-size:11.5px;font-weight:600;color:${im.traitee ? "#166534" : "#9a3412"}">${im.traitee ? "✓ " + __("traitée par l’IA") : __("pas encore traitée")}</span>
 						</div>
 						${im.principale ? `<div style="font-size:11px;color:var(--text-muted)">${__("image principale")}</div>` : ""}
-					</label>`).join("")}
+						</label>
+						${im.avant_url ? `<div style="font-size:11px"><a href="${esc(im.avant_url)}" target="_blank" title="${__("Voir l’image d’avant la retouche")}">↩ ${__("image d’avant disponible")}</a></div>` : ""}
+						<textarea class="form-control" data-wcf-consigne="${esc(im.name)}" rows="2" maxlength="600"
+							placeholder="${__("Consigne pour cette image (facultatif)")}" style="margin-top:6px;font-size:12px;min-height:52px"></textarea>
+					</div>`).join("")}
 				</div>`);
 			d.show();
 		});

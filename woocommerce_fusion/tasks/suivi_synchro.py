@@ -19,8 +19,12 @@ font rien : le reste du code les appelle sans condition.
 Retouche manuelle d'images (même jour) : « lorsque c'est traité par l'IA on ne la retraite plus, mais si elle est
 traitée on peut la retraiter, une image, en ajoutant une consigne ». Le passage automatique ne touche jamais une image
 déjà traitée ; `lancer_retouche(item_code, fichiers, consigne)` (fenêtre « Retoucher des images avec l'IA » de la
-fiche) repasse à l'IA les images CHOISIES, traitées ou non, avec la consigne écrite par l'utilisateur, puis
-synchronise l'article si demandé. Même tâche de fond, même bandeau.
+fiche) repasse à l'IA les images CHOISIES, traitées ou non, avec la consigne écrite par l'utilisateur.
+
+Contrôle avant (même soir, après une retouche fausse partie directement sur le site) : la retouche ne remplace plus
+rien. Elle produit des PROPOSITIONS, l'état passe à « à valider », la fiche montre l'avant / après et l'utilisateur
+choisit image par image (`valider_retouches`) ; seules les retouches gardées prennent la place de l'ancienne image,
+puis l'article part sur le site si c'était demandé. `restaurer` remet l'image d'avant à la place d'une retouche.
 """
 from __future__ import annotations
 
@@ -38,6 +42,8 @@ DUREE_JOB = 30 * 60
 ETAPES = {
     "attente": "En file d’attente",
     "retouche": "Retouche des images choisies",
+    "application": "Mise en place des retouches gardées",
+    "restauration": "Retour aux images d’avant",
     "site": "Lecture du produit sur le site",
     "classement": "Classement de l’article (groupe, collections)",
     "textes": "Textes du site et SEO",
@@ -61,17 +67,23 @@ def etapes_prevues(item: dict) -> list[str]:
     return prevues + ["fiche", "images_site", "finitions"]
 
 
-def etapes_retouche(item: dict, synchroniser: bool) -> list[str]:
-    """Retouche manuelle : les images choisies d'abord, puis la synchronisation si elle est demandée."""
-    return ["retouche"] + (etapes_prevues(item) if synchroniser else [])
+def etapes_apres(premiere: str, item: dict, synchroniser: bool) -> list[str]:
+    """Une étape sur les images (« application » des retouches gardées, « restauration »), puis la synchronisation si
+    elle est demandée."""
+    return [premiere] + (etapes_prevues(item) if synchroniser else [])
 
 
 # Ce que le bandeau dit, selon ce qui a été lancé.
 LIBELLES = {
     "synchro": {"titre": "Synchronisation avec le site", "fait": "Synchronisé avec le site",
                 "rate": "La synchronisation avec le site a échoué"},
-    "retouche": {"titre": "Retouche des images", "fait": "Images retouchées", "rate": "La retouche des images a échoué"},
+    "retouche": {"titre": "Retouche des images", "fait": "Retouches prêtes", "rate": "La retouche des images a échoué"},
+    "validation": {"titre": "Mise en place des retouches", "fait": "Retouches mises en place",
+                   "rate": "La mise en place des retouches a échoué"},
+    "restauration": {"titre": "Retour aux images d’avant", "fait": "Images d’avant remises",
+                     "rate": "Le retour aux images d’avant a échoué"},
 }
+A_VALIDER = "a_valider"            # des retouches attendent le choix de l'utilisateur : rien n'est encore remplacé
 
 
 def avancer(etat: dict, code: str, detail: str | None = None) -> dict:
@@ -186,15 +198,30 @@ def _a_un_site(item_code: str) -> bool:
     return bool(frappe.db.exists("Item WooCommerce Server", {"parent": item_code, "parenttype": "Item"}))
 
 
-def _mettre_en_file(item_code: str, genre: str, prevues: list, methode: str, **arguments) -> dict:
+def _mettre_en_file(item_code: str, genre: str, prevues: list, methode: str, en_plus: dict | None = None, **arguments) -> dict:
     maintenant = str(now_datetime())
     nouvel = _ecrire(dict({"item": item_code, "genre": genre, "etat": "attente", "etape": "attente", "libelle": ETAPES["attente"],
                            "detail": "", "etapes": prevues, "rang": 0, "total": len(prevues), "debut": maintenant, "fin": None,
-                           "par": frappe.session.user, "avertissements": [], "resume": [], "message": ""}, **LIBELLES[genre]))
+                           "par": frappe.session.user, "avertissements": [], "resume": [], "message": ""},
+                          **dict(LIBELLES[genre], **(en_plus or {}))))
     frappe.enqueue("woocommerce_fusion.tasks.suivi_synchro." + methode, queue="long", timeout=DUREE_JOB,
                    job_id="wcf_synchro::" + item_code, deduplicate=True, enqueue_after_commit=True,
                    item_code=item_code, **arguments)
     return nouvel
+
+
+def _occupe(item_code: str) -> dict | None:
+    """L'état en cours s'il y en a un (on ne lance pas deux traitements sur le même article)."""
+    actuel = etat(item_code)
+    return dict(actuel, deja=1) if actuel and actuel.get("etat") in EN_COURS else None
+
+
+def _jeter_les_propositions(item_code: str) -> None:
+    """Des retouches proposées et jamais validées : elles sont supprimées avant de lancer autre chose."""
+    actuel = _lire(item_code)
+    if actuel and actuel.get("etat") == A_VALIDER and actuel.get("propositions"):
+        from woocommerce_fusion.integrations.content_enrichment import supprimer_propositions
+        supprimer_propositions(actuel["propositions"])
 
 
 @frappe.whitelist()
@@ -203,40 +230,87 @@ def lancer(item_code: str) -> dict:
     item = _article(item_code)
     if not _a_un_site(item_code):
         frappe.throw(_("Aucun site WooCommerce n’est défini sur l’article {0}.").format(item_code))
-    actuel = etat(item_code)
-    if actuel and actuel.get("etat") in EN_COURS:
-        return dict(actuel, deja=1)
+    occupe = _occupe(item_code)
+    if occupe:
+        return occupe
+    _jeter_les_propositions(item_code)
     return _mettre_en_file(item_code, "synchro", etapes_prevues(item), "executer")
 
 
 @frappe.whitelist()
 def images(item_code: str) -> list:
-    """Les images de l'article, pour la fenêtre de retouche manuelle : adresse, traitée ou non, principale ou non."""
+    """Les images de l'article, pour la fenêtre de retouche manuelle : adresse, traitée ou non, principale ou non,
+    et l'image d'avant quand une retouche l'a remplacée."""
     frappe.has_permission("Item", "read", item_code, throw=True)
     from woocommerce_fusion.integrations.content_enrichment import images_de_l_article
     return images_de_l_article(item_code)
 
 
-@frappe.whitelist()
-def lancer_retouche(item_code: str, fichiers, consigne: str | None = None, synchroniser: int | str = 1) -> dict:
-    """Retouche manuelle : les images choisies repassent à l'IA (traitées ou non) avec la consigne de l'utilisateur,
-    puis l'article est synchronisé avec le site si `synchroniser`."""
-    item = _article(item_code)
+def _images_choisies(item_code: str, fichiers) -> list:
     fichiers = frappe.parse_json(fichiers) if isinstance(fichiers, str) else list(fichiers or [])
     connues = {i["name"] for i in images(item_code)}
     fichiers = [f for f in fichiers if f in connues]
     if not fichiers:
         frappe.throw(_("Choisissez au moins une image de cet article."))
-    synchroniser = cint(synchroniser) and _a_un_site(item_code)
-    actuel = etat(item_code)
-    if actuel and actuel.get("etat") in EN_COURS:
-        return dict(actuel, deja=1)
-    return _mettre_en_file(item_code, "retouche", etapes_retouche(item, bool(synchroniser)), "executer_retouche",
-                           fichiers=fichiers, consigne=(consigne or "").strip(), synchroniser=cint(synchroniser))
+    return fichiers
+
+
+@frappe.whitelist()
+def lancer_retouche(item_code: str, fichiers, consignes=None, synchroniser: int | str = 1) -> dict:
+    """Retouche manuelle, premier temps : les images choisies repassent à l'IA (traitées ou non), chacune avec SA
+    consigne (`consignes` = {nom du fichier: texte}, facultatif). Rien n'est remplacé : le résultat attend sa
+    validation (`valider_retouches`)."""
+    _article(item_code)
+    fichiers = _images_choisies(item_code, fichiers)
+    consignes = frappe.parse_json(consignes) if isinstance(consignes, str) else dict(consignes or {})
+    consignes = {f: str(consignes.get(f) or "").strip() for f in fichiers if str(consignes.get(f) or "").strip()}
+    occupe = _occupe(item_code)
+    if occupe:
+        return occupe
+    _jeter_les_propositions(item_code)
+    return _mettre_en_file(item_code, "retouche", ["retouche"], "executer_propositions",
+                           en_plus={"synchroniser": cint(cint(synchroniser) and _a_un_site(item_code))},
+                           fichiers=fichiers, consignes=consignes)
+
+
+@frappe.whitelist()
+def valider_retouches(item_code: str, gardees=None) -> dict:
+    """Retouche manuelle, second temps : `gardees` = les images (nom de l'ANCIEN fichier) dont on garde la retouche.
+    Les autres propositions sont supprimées. Puis l'article part sur le site si c'était demandé au lancement."""
+    item = _article(item_code)
+    actuel = _lire(item_code)
+    if not actuel or actuel.get("etat") != A_VALIDER:
+        frappe.throw(_("Aucune retouche n’attend de validation pour cet article."))
+    gardees = frappe.parse_json(gardees) if isinstance(gardees, str) else list(gardees or [])
+    propositions = actuel.get("propositions") or []
+    gardees = [g for g in gardees if g in {p["ancien"] for p in propositions}]
+    if not gardees:            # tout est refusé : rien à faire d'autre que jeter les propositions
+        _jeter_les_propositions(item_code)
+        actuel.update(etat="terminee", fin=str(now_datetime()), propositions=[], fait="Retouches refusées",
+                      resume=["aucune retouche gardée : les images restent telles qu’elles étaient"])
+        return _ecrire(actuel)
+    synchroniser = cint(actuel.get("synchroniser"))
+    return _mettre_en_file(item_code, "validation", etapes_apres("application", item, bool(synchroniser)), "executer_validation",
+                           propositions=propositions, gardees=gardees, synchroniser=synchroniser)
+
+
+@frappe.whitelist()
+def restaurer(item_code: str, fichiers, synchroniser: int | str = 1) -> dict:
+    """« Revenir à l'image d'avant » pour les images choisies, puis synchronisation si demandée."""
+    item = _article(item_code)
+    fichiers = _images_choisies(item_code, fichiers)
+    occupe = _occupe(item_code)
+    if occupe:
+        return occupe
+    _jeter_les_propositions(item_code)
+    synchroniser = cint(cint(synchroniser) and _a_un_site(item_code))
+    return _mettre_en_file(item_code, "restauration", etapes_apres("restauration", item, bool(synchroniser)), "executer_restauration",
+                           fichiers=fichiers, synchroniser=synchroniser)
 
 
 # ── le travail, dans la file ─────────────────────────────────────────────────
 def _travailler(item_code: str, travail) -> None:
+    """`travail()` peut renvoyer de quoi compléter l'état final (par défaut : « terminée »)."""
     frappe.flags.wcf_suivi = item_code
     try:
         try:        # une image principale qui pointe sur un fichier disparu fait échouer chaque enregistrement
@@ -244,10 +318,10 @@ def _travailler(item_code: str, travail) -> None:
             reparer_image_principale(item_code)
         except Exception:
             frappe.log_error(title="Synchronisation manuelle : image principale", message=frappe.get_traceback())
-        travail()
+        final = travail() or {}
         frappe.db.commit()
         e = _lire(item_code) or {"item": item_code}
-        e.update(etat="terminee", fin=str(now_datetime()), detail="", message="")
+        e.update(dict({"etat": "terminee", "fin": str(now_datetime()), "detail": "", "message": ""}, **final))
         _ecrire(e)
     except Exception as erreur:
         frappe.db.rollback()
@@ -262,15 +336,42 @@ def _travailler(item_code: str, travail) -> None:
 
 def executer(item_code: str) -> None:
     from woocommerce_fusion.tasks.sync_items import run_item_sync
-    _travailler(item_code, lambda: run_item_sync(item_code=item_code))
+    _travailler(item_code, lambda: run_item_sync(item_code=item_code) and None)
 
 
-def executer_retouche(item_code: str, fichiers: list, consigne: str = "", synchroniser: int = 1) -> None:
-    from woocommerce_fusion.integrations.content_enrichment import retraiter_images
+def executer_propositions(item_code: str, fichiers: list, consignes: dict | None = None) -> None:
+    from woocommerce_fusion.integrations.content_enrichment import proposer_retouches
+
+    def travail():
+        propositions, echecs = proposer_retouches(item_code, fichiers, consignes)
+        if echecs:
+            avertir("%d image(s) non retouchée(s) : %s. Elles restent telles qu’elles étaient." % (len(echecs), echecs[0]))
+        if not propositions:
+            return {"fait": "Aucune retouche obtenue"}
+        return {"etat": A_VALIDER, "propositions": propositions}
+
+    _travailler(item_code, travail)
+
+
+def executer_validation(item_code: str, propositions: list, gardees: list, synchroniser: int = 1) -> None:
+    from woocommerce_fusion.integrations.content_enrichment import appliquer_retouches
     from woocommerce_fusion.tasks.sync_items import run_item_sync
 
     def travail():
-        retraiter_images(item_code, fichiers, consigne)
+        appliquer_retouches(item_code, propositions, gardees)
+        if cint(synchroniser):
+            run_item_sync(item_code=item_code)
+        return {"propositions": []}
+
+    _travailler(item_code, travail)
+
+
+def executer_restauration(item_code: str, fichiers: list, synchroniser: int = 1) -> None:
+    from woocommerce_fusion.integrations.content_enrichment import restaurer_images
+    from woocommerce_fusion.tasks.sync_items import run_item_sync
+
+    def travail():
+        restaurer_images(item_code, fichiers)
         if cint(synchroniser):
             run_item_sync(item_code=item_code)
 

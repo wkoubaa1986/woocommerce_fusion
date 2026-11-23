@@ -44,15 +44,20 @@ class TestEtapes(unittest.TestCase):
 		self.assertEqual(S.etapes_prevues({"custom_generate_tag": 1})[:2], ["site", "classement"])
 		self.assertNotIn("classement", S.etapes_prevues({"custom_generate_tag": 1, "variant_of": "Modele"}))
 
-	def test_retouche_manuelle_puis_synchronisation(self):
-		self.assertEqual(S.etapes_retouche({}, synchroniser=True), ["retouche", "site", "fiche", "images_site", "finitions"])
-		self.assertEqual(S.etapes_retouche({}, synchroniser=False), ["retouche"])
-		# « Générer SEO » coché : la synchronisation retouche ensuite les images NON traitées, c'est une autre étape
-		self.assertEqual(S.etapes_retouche({"custom_generate_seo": 1}, True)[:4], ["retouche", "site", "textes", "images"])
+	def test_apres_validation_mise_en_place_puis_synchronisation(self):
+		self.assertEqual(S.etapes_apres("application", {}, True), ["application", "site", "fiche", "images_site", "finitions"])
+		self.assertEqual(S.etapes_apres("application", {}, False), ["application"])
+		self.assertEqual(S.etapes_apres("restauration", {"custom_generate_seo": 1}, True)[:4], ["restauration", "site", "textes", "images"])
 
 	def test_le_bandeau_dit_ce_qui_a_ete_lance(self):
-		self.assertEqual(S.LIBELLES["retouche"]["fait"], "Images retouchées")
+		self.assertEqual(S.LIBELLES["retouche"]["fait"], "Retouches prêtes")
 		self.assertEqual(S.LIBELLES["synchro"]["titre"], "Synchronisation avec le site")
+		self.assertEqual(set(S.LIBELLES), {"synchro", "retouche", "validation", "restauration"})
+
+	def test_a_valider_n_est_pas_en_cours(self):
+		"""Des retouches qui attendent le choix de l'utilisateur ne bloquent rien et ne sont jamais « interrompues »."""
+		self.assertNotIn(S.A_VALIDER, S.EN_COURS)
+		self.assertFalse(S.interrompue({"etat": S.A_VALIDER, "maj": "2026-11-20 08:00:00"}, "2026-11-23 20:00:00"))
 
 	def test_avancer_donne_le_rang(self):
 		e = {"item": "A", "etapes": ["textes", "images", "fiche", "images_site", "finitions"]}
@@ -196,12 +201,14 @@ class TestRetouche(unittest.TestCase):
 		self.assertIn('"""enlève le reflet sur le capot"""', p)
 		self.assertIn("It has priority over the framing, background and lighting rules", p)
 		self.assertIn("nor to remove or alter any dimension, number or label", p)          # les cotes restent protégées
-		self.assertLessEqual(len(C.consigne_complete("x" * 5000)) - len(C.EDIT_PROMPT), C.CONSIGNE_MAX + 500)
+		longue = C.consigne_complete("x" * 5000)                 # une consigne trop longue est coupée
+		self.assertIn("x" * C.CONSIGNE_MAX, longue)
+		self.assertNotIn("x" * (C.CONSIGNE_MAX + 1), longue)
 
 	def test_la_consigne_part_avec_l_image(self):
 		client = mock.Mock()
 		client.models.generate_content.return_value = _Reponse(_image())
-		with mock.patch.object(C, "_read_gemini_model", return_value="modele"):
+		with mock.patch.object(C, "_read_gemini_model", return_value="modele"), mock.patch.object(C.frappe, "log_error"):
 			C._gemini_retoucher(client, _image(), "montre le produit de face")
 		demande = client.models.generate_content.call_args.kwargs["contents"][1]
 		self.assertIn("montre le produit de face", demande)
@@ -212,7 +219,40 @@ class TestRetouche(unittest.TestCase):
 		source = inspect.getsource(C.treat_left_item_images)
 		self.assertIn("if treated == 1:\n            continue", source)
 		self.assertNotIn("consigne", source)
-		self.assertIn("_gemini_retoucher(gemini_client, old_doc.get_content(), consigne)", inspect.getsource(C.retraiter_images))
+
+	def test_la_consigne_n_invente_rien(self):
+		"""Retouche fausse du 23/11/2026 : des cotes dessinées sur une photo qui n'en avait pas, un gris devenu blanc."""
+		self.assertIn("NEVER add dimension lines, arrows, numbers, labels or any text that are not in the original photo", C.EDIT_PROMPT)
+		self.assertIn("NEVER change the colors or the materials of the product", C.EDIT_PROMPT)
+		p = C.consigne_complete("écris les cotes en rouge")
+		self.assertIn("If the instruction mentions something that does not exist in THIS image", p)
+		self.assertIn("never draw it, never invent", p)
+
+	def test_la_retouche_manuelle_ne_remplace_rien_avant_validation(self):
+		import inspect
+		proposer = inspect.getsource(C.proposer_retouches)
+		self.assertNotIn("_remplacer_par_retouche", proposer)                 # premier temps : des propositions seulement
+		self.assertIn('"doctype": "File", "file_name": "proposition-', proposer)   # mises de côté, jointes à rien
+		self.assertIn("_remplacer_par_retouche", inspect.getsource(C.appliquer_retouches))
+		self.assertIn('"etat": A_VALIDER', inspect.getsource(S.executer_propositions))
+
+	def test_une_consigne_par_image(self):
+		import inspect
+		self.assertIn("consigne_complete(consignes.get(nom))", inspect.getsource(C.proposer_retouches))
+		self.assertIn("consignes = {f: str(consignes.get(f) or", inspect.getsource(S.lancer_retouche))
+
+	def test_plusieurs_retouches_en_meme_temps(self):
+		import inspect
+		self.assertIn("ThreadPoolExecutor(max_workers=min(RETOUCHES_EN_PARALLELE", inspect.getsource(C.proposer_retouches))
+		self.assertEqual(C.RETOUCHES_EN_PARALLELE, 4)
+		# la retouche qui tourne dans un fil à part ne touche à rien de Frappe
+		pure = inspect.getsource(C._retouche_pure)
+		self.assertNotIn("frappe.", pure.split('"""', 2)[2])
+
+	def test_l_image_d_avant_est_notee(self):
+		import inspect
+		self.assertEqual(C.CHAMP_IMAGE_AVANT, "custom_image_avant")
+		self.assertIn("CHAMP_IMAGE_AVANT, old_id", inspect.getsource(C._remplacer_par_retouche))
 
 	def test_l_ancienne_entree_rend_toujours_des_octets(self):
 		with mock.patch.object(C, "_gemini_retoucher", return_value=(b"x", False, "raison")):
@@ -250,13 +290,50 @@ class TestFicheEtDependances(unittest.TestCase):
 		self.assertIn('METHODE: "woocommerce_fusion.tasks.suivi_synchro."', js)
 		self.assertNotIn("woocommerce_fusion.tasks.sync_items.run_item_sync", js)      # plus d'appel direct, écran gelé
 		self.assertIn("wcf_synchro.suivre(frm)", js)
-		self.assertIn('this.METHODE + "lancer_retouche"', js)                       # la retouche manuelle avec consigne
-		self.assertIn("fieldname: \"consigne\"", js)
+		self.assertIn('this.METHODE + "lancer_retouche"', js)                       # la retouche manuelle
+		self.assertIn("data-wcf-consigne=", js)                                     # une consigne par image
+		self.assertIn('this.METHODE + "valider_retouches"', js)                     # le contrôle avant
+		self.assertIn('this.METHODE + "restaurer"', js)                             # revenir à l'image d'avant
 
 	def test_bibliotheque_google_bornee(self):
 		"""Sans borne, chaque reconstruction de la prod prenait la dernière version majeure."""
 		with open(os.path.join(os.path.dirname(RACINE), "requirements.txt"), encoding="utf-8") as f:
 			self.assertIn("google-genai>=2.0,<4", f.read().split())
+
+
+
+class TestModelesParEtape(unittest.TestCase):
+	"""« Remets tout en setting » : chaque étape lit son modèle dans AI Settings."""
+
+	def test_temperature_seulement_pour_les_anciens_modeles(self):
+		for accepte in ("gpt-4o-mini", "gpt-4.1-mini", "GPT-4o"):
+			self.assertTrue(C.accepte_temperature(accepte), accepte)
+		# vérifié avec la clé du site le 23/11/2026 : « Only the default (1) value is supported »
+		for refuse in ("gpt-6.2-sol", "gpt-6.1-terra", "gpt-6-luna", "gpt-5-mini", "gpt-5.2", ""):
+			self.assertFalse(C.accepte_temperature(refuse), refuse)
+		self.assertTrue(C._is_gpt5("gpt-6-luna"))
+
+	def test_le_reglage_passe_avant_le_modele_d_avant(self):
+		with mock.patch.object(C, "_read_ai_setting", return_value=" gpt-6-luna "):
+			self.assertEqual(C.modele_etape("keywords_model"), "gpt-6-luna")
+		with mock.patch.object(C, "_read_ai_setting", return_value=None):
+			self.assertEqual(C.modele_etape("keywords_model"), "gpt-5-mini")
+			self.assertEqual(C.modele_etape("web_search_model"), "gpt-4.1-mini")
+		with mock.patch.object(C, "_read_ai_setting", side_effect=RuntimeError("champ absent")):
+			self.assertEqual(C.modele_etape("alt_model"), "gpt-4o-mini")
+
+	def test_plus_de_modele_ecrit_en_dur_dans_les_etapes(self):
+		import inspect
+		source = inspect.getsource(C)
+		for attendu in ('model_key = modele_etape("keywords_model")', 'modele_etape("logistics_model")',
+						'model_name = modele_etape("alt_model")', 'WEB_MODEL = modele_etape("web_search_model")'):
+			self.assertIn(attendu, source, attendu)
+
+	def test_reglages_poses(self):
+		from woocommerce_fusion.setup import reglages_ia as R
+		self.assertEqual(R.MODELES["open_ai_model"][1:3], ("gpt-6.2-sol", ("gpt-5.2",)))
+		self.assertEqual({R.MODELES[c][1] for c in R.NOUVEAUX}, {"gpt-6-luna"})
+		self.assertEqual(set(R.NOUVEAUX), set(C.MODELES_PAR_ETAPE))
 
 
 if __name__ == "__main__":
