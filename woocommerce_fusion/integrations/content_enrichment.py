@@ -3604,6 +3604,47 @@ def pieces_probables(nom: str, description: str | None, attributs: list | None) 
     return {"bouteille": ("FRP-" + m.group(1)) if m else None, "bac": ("BT-" + b.group(1)) if b else None, "modeles": modeles[:4]}
 
 
+def mots_de_recherche(texte: str | None) -> list:
+    """Les mots d'une recherche, sans les blancs ni les doublons : « frp  1035 » -> ["frp", "1035"]. Pure."""
+    mots = []
+    for mot in (texte or "").replace(",", " ").split():
+        if mot.lower() not in [m.lower() for m in mots]:
+            mots.append(mot)
+    return mots[:6]
+
+
+def chercher_articles_avec_image(texte: str | None, limite: int = 24) -> list:
+    """Recherche d'un article à prendre comme photo source (23/11/2026 : « la recherche des articles n'est pas facile,
+    lorsque je veux frp il me sort tous les articles »).
+
+    - seulement les articles actifs qui ONT une image (les autres ne servent à rien comme source) ;
+    - chaque mot doit se trouver dans le code, le nom, la marque ou le groupe (« frp 1035 » ne rend pas tous les FRP) ;
+    - d'abord ceux dont le CODE commence par la recherche (FRP-1035 avant « Crépine pour réservoir FRP »), puis les
+      codes qui la contiennent, puis les noms ; à égalité, le code le plus court d'abord.
+    Renvoie [{name, item_name, item_group, file_url, fichier}] — `fichier` = la fiche Fichier de l'image principale."""
+    mots = mots_de_recherche(texte)
+    if not mots:
+        return []
+    conditions, valeurs = ["i.disabled = 0", "ifnull(i.image, '') != ''"], []
+    for mot in mots:            # dans le code, le nom, la marque ou le groupe (« vanne keman », « bac à sel »)
+        conditions.append("(i.name like %s or i.item_name like %s or ifnull(i.brand, '') like %s or i.item_group like %s)")
+        valeurs += ["%" + mot + "%"] * 4
+    premier = mots[0]
+    lignes = frappe.db.sql(
+        """select i.name, i.item_name, i.item_group, i.image as file_url
+           from `tabItem` i where {0}
+           order by (i.name like %s) desc, (i.name like %s) desc, char_length(i.name) asc, i.name asc
+           limit {1}""".format(" and ".join(conditions), min(int(limite or 24), 60)),
+        valeurs + [premier + "%", "%" + premier + "%"], as_dict=True)
+    sortie = []
+    for l in lignes:
+        source = _image_principale_en_source(l.name)
+        if source:
+            sortie.append({"name": l.name, "item_name": l.item_name, "item_group": l.item_group,
+                           "file_url": source["file_url"], "fichier": source["name"]})
+    return sortie
+
+
 def _image_principale_en_source(code: str):
     """La photo principale d'un article, comme photo source : {name, file_url, de} ou None."""
     url = (frappe.db.get_value("Item", code, "image") or "").strip()

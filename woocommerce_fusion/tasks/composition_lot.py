@@ -55,9 +55,10 @@ def articles(groupe: str | None = None, sans_image: int | str = 1, texte: str | 
         groupes = frappe.db.get_descendants("Item Group", groupe) + [groupe]
         conditions.append("i.item_group in %s")
         valeurs.append(groupes)
-    if (texte or "").strip():
+    from woocommerce_fusion.integrations.content_enrichment import mots_de_recherche
+    for mot in mots_de_recherche(texte):            # chaque mot doit s'y trouver : « frp 1035 » ne rend pas tous les FRP
         conditions.append("(i.name like %s or i.item_name like %s)")
-        valeurs += ["%" + texte.strip() + "%"] * 2
+        valeurs += ["%" + mot + "%"] * 2
     lignes = frappe.db.sql(
         """select i.name, i.item_name, i.item_group, i.image, i.has_variants, i.variant_of
            from `tabItem` i where {0} order by i.item_group, i.name limit {1}""".format(" and ".join(conditions), min(cint(limite) or 200, 500)),
@@ -65,6 +66,12 @@ def articles(groupe: str | None = None, sans_image: int | str = 1, texte: str | 
     for l in lignes:
         l["sources"] = sources_proposees(l.name)
     return lignes
+
+
+@frappe.whitelist()
+def chercher_sources(texte: str | None = None) -> list:
+    """Recherche d'un article à prendre comme photo source (voir suivi_synchro.chercher_sources)."""
+    return S.chercher_sources(texte)
 
 
 @frappe.whitelist()

@@ -300,6 +300,16 @@ def valider_retouches(item_code: str, gardees=None) -> dict:
                            propositions=propositions, gardees=gardees, synchroniser=synchroniser)
 
 
+@frappe.whitelist()
+def chercher_sources(texte: str | None = None) -> list:
+    """Les articles qui ont une image et dont le code ou le nom porte TOUS les mots cherchés : pour prendre leur photo
+    comme source d'une composition."""
+    if not frappe.has_permission("Item", "read"):
+        frappe.throw(_("Vous n’avez pas le droit de lire les articles."), frappe.PermissionError)
+    from woocommerce_fusion.integrations.content_enrichment import chercher_articles_avec_image
+    return chercher_articles_avec_image(texte)
+
+
 def _sources(sources) -> list:
     """Les photos sources d'une composition : des fiches Fichier que l'utilisateur a le droit de lire."""
     sources = frappe.parse_json(sources) if isinstance(sources, str) else list(sources or [])

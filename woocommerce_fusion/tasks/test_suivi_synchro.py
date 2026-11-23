@@ -525,9 +525,26 @@ class TestComposerDesImagesEnLot(unittest.TestCase):
 		self.assertIn("ThreadPoolExecutor(max_workers=min(RETOUCHES_EN_PARALLELE", source)
 		self.assertNotIn("attached_to_doctype", source)              # des propositions seulement, jointes à rien
 
+	def test_mots_de_recherche(self):
+		self.assertEqual(C.mots_de_recherche("  frp   1035 "), ["frp", "1035"])
+		self.assertEqual(C.mots_de_recherche("FRP, frp bac"), ["FRP", "bac"])
+		self.assertEqual(C.mots_de_recherche(None), [])
+
+	def test_la_recherche_de_sources_est_ciblee(self):
+		"""« Lorsque je veux frp il me sort tous les articles » : chaque mot compte, articles avec image, code d'abord."""
+		import inspect
+		source = inspect.getsource(C.chercher_articles_avec_image)
+		self.assertIn("ifnull(i.image, '') != ''", source)
+		self.assertIn("for mot in mots:", source)
+		self.assertIn("order by (i.name like %s) desc", source)
+		with open(os.path.join(RACINE, "public", "js", "stock", "item.js"), encoding="utf-8") as f:
+			js = f.read()
+		self.assertIn('methodes + "chercher_sources"', js)
+		self.assertNotIn('fieldname: "article", options: "Item"', js)          # plus de champ Lien qui sort tout
+
 	def test_la_page_et_son_serveur(self):
 		from woocommerce_fusion.tasks import composition_lot as L
-		for nom in ("articles", "images_de", "lancer", "etat", "valider"):
+		for nom in ("articles", "chercher_sources", "images_de", "lancer", "etat", "valider"):
 			self.assertTrue(callable(getattr(L, nom)), nom)
 		self.assertEqual(L.LOT_MAX, 60)
 		base = os.path.join(RACINE, "woocommerce", "page", "composer_images")

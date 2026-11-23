@@ -33,7 +33,7 @@ class ComposerImages {
 	construire() {
 		const p = this.page;
 		this.f_groupe = p.add_field({ fieldtype: "Link", options: "Item Group", fieldname: "groupe", label: __("Groupe d’articles"), change: () => this.charger() });
-		this.f_texte = p.add_field({ fieldtype: "Data", fieldname: "texte", label: __("Code ou nom contient"), change: () => this.charger() });
+		this.f_texte = p.add_field({ fieldtype: "Data", fieldname: "texte", label: __("Mots du code ou du nom (frp 1035)"), change: () => this.charger() });
 		this.f_sans = p.add_field({ fieldtype: "Check", fieldname: "sans_image", label: __("Sans image seulement"), default: 1, change: () => this.charger() });
 		p.set_primary_action(__("Composer les images cochées"), () => this.lancer());
 		this.$corps = $(`
@@ -143,27 +143,14 @@ class ComposerImages {
 		this.$corps.find("[data-compte]").text(n ? n + " " + __("article(s) coché(s)") + " — " + __("environ") + " " + Math.max(1, Math.ceil(n / 4 * 25 / 60)) + " min" : "");
 	}
 
-	/** Fenêtre pour prendre des photos : celles d'un autre article, ou des fichiers déposés. */
+	/** Fenêtre pour prendre des photos : celles d'un autre article (recherche par mots), ou des fichiers déposés. */
 	choisir_sources(prendre) {
-		const esc = this.esc;
 		const d = new frappe.ui.Dialog({
 			title: __("Ajouter une photo source"),
 			size: "large",
 			fields: [
-				{ fieldtype: "Link", fieldname: "article", options: "Item", label: __("Prendre des images d’un article"),
-					onchange: () => {
-						const code = d.get_value("article");
-						const $z = d.fields_dict.dispo.$wrapper;
-						if (!code) { $z.empty(); return; }
-						frappe.call({ method: this.M + "images_de", args: { item_code: code } }).then((r) => {
-							const images = r.message || [];
-							$z.html(images.length ? `<div style="color:var(--text-muted);margin-bottom:6px">${__("Cliquez sur une image pour la prendre.")}</div>
-								<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:8px">${images.map((x) => `
-									<div data-prendre="${esc(x.name)}" data-url="${esc(x.file_url)}" data-de="${esc(code)}" style="border:1px solid var(--border-color);border-radius:8px;padding:4px;background:#fff;cursor:pointer">
-										<img src="${esc(x.file_url)}" style="width:100%;height:96px;object-fit:contain" loading="lazy"></div>`).join("")}</div>`
-								: `<div style="color:var(--text-muted)">${__("Cet article n’a aucune image.")}</div>`);
-						});
-					} },
+				{ fieldtype: "Data", fieldname: "recherche", label: __("Chercher un article pour prendre sa photo"),
+					description: __("Tapez un ou plusieurs mots du code, du nom ou de la marque : « frp 1035 », « runxin f65 », « bac »… Seuls les articles qui ont une image sont proposés.") },
 				{ fieldtype: "HTML", fieldname: "dispo" },
 				{ fieldtype: "Button", fieldname: "deposer", label: __("Ajouter mes propres images"),
 					click: () => new frappe.ui.FileUploader({
@@ -175,12 +162,56 @@ class ComposerImages {
 			primary_action_label: __("Terminé"),
 			primary_action: () => d.hide(),
 		});
-		d.$wrapper.on("click", "[data-prendre]", (e) => {
+		this.brancher_recherche(d.fields_dict.recherche, d.fields_dict.dispo.$wrapper, prendre);
+		d.show();
+	}
+
+	/**
+	 * Recherche d'un article pour prendre sa photo (23/11/2026 : « la recherche des articles n'est pas facile, lorsque
+	 * je veux frp il me sort tous les articles »). On tape des mots ; les articles qui ont une image s'affichent avec
+	 * leur photo ; un clic la prend, « autres images » montre les autres.
+	 */
+	brancher_recherche(champ, $zone, prendre) {
+		const esc = this.esc;
+		const carte = (a) => `
+			<div style="border:1px solid var(--border-color);border-radius:8px;padding:6px;background:var(--card-bg,#fff)">
+				<div data-prendre="${esc(a.fichier)}" data-url="${esc(a.file_url)}" data-de="${esc(a.name)}" style="cursor:pointer" title="${__("Prendre cette photo")}">
+					<img src="${esc(a.file_url)}" style="width:100%;height:104px;object-fit:contain;background:#fff;border-radius:6px" loading="lazy">
+					<div style="font-weight:700;font-size:12px;margin-top:4px">${esc(a.name)}</div>
+					<div style="font-size:11px;line-height:1.25;color:var(--text-muted);max-height:28px;overflow:hidden">${esc(a.item_name || "")}</div>
+				</div>
+				<a href="#" data-autres="${esc(a.name)}" onclick="return false" style="font-size:11px">${__("autres images")}</a>
+				<div data-autres-zone></div>
+			</div>`;
+		let attente = null, derniere = "";
+		const chercher = () => {
+			const texte = (champ.get_value() || "").trim();
+			if (texte === derniere) return;
+			derniere = texte;
+			if (texte.length < 2) { $zone.empty(); return; }
+			frappe.call({ method: this.M + "chercher_sources", args: { texte: texte } }).then((r) => {
+				if (texte !== derniere) return; // une frappe plus récente est partie entre-temps
+				const articles = r.message || [];
+				$zone.html(articles.length
+					? `<div style="color:var(--text-muted);margin:4px 0 6px">${articles.length} ${__("article(s) avec image — cliquez sur une photo pour la prendre")}</div>
+						<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:8px">${articles.map(carte).join("")}</div>`
+					: `<div style="color:var(--text-muted);margin-top:4px">${__("Aucun article avec image ne porte tous ces mots.")}</div>`);
+			});
+		};
+		champ.$input.on("input", () => { clearTimeout(attente); attente = setTimeout(chercher, 350); });
+		$zone.on("click", "[data-prendre]", (e) => {
 			const $v = $(e.currentTarget);
 			prendre({ name: $v.attr("data-prendre"), file_url: $v.attr("data-url"), de: $v.attr("data-de") });
-			$v.css("opacity", 0.4);
+			$v.css("opacity", 0.45);
 		});
-		d.show();
+		$zone.on("click", "[data-autres]", (e) => {
+			const $l = $(e.currentTarget), code = $l.attr("data-autres"), $a = $l.siblings("[data-autres-zone]");
+			frappe.call({ method: this.M + "images_de", args: { item_code: code } }).then((r) => {
+				$a.html((r.message || []).map((x) => `<img data-prendre="${esc(x.name)}" data-url="${esc(x.file_url)}" data-de="${esc(code)}" src="${esc(x.file_url)}"
+					style="width:44px;height:44px;object-fit:contain;border:1px solid var(--border-color);border-radius:6px;background:#fff;margin:4px 4px 0 0;cursor:pointer" loading="lazy">`).join(""));
+				$l.hide();
+			});
+		});
 	}
 
 	lancer() {

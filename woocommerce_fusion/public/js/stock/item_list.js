@@ -35,6 +35,11 @@ frappe.listview_settings['Item'] = {
             );
         });
 
+        // 🖼️ La page « Composer des images » : composer l'image de plusieurs articles sans photo d'un coup.
+        listview.page.add_inner_button(__('Composer des images'), function() {
+            frappe.set_route('composer-images');
+        });
+
         // Ajouter le bouton personnalisé
         listview.page.add_inner_button(__('Sync Active Items'), function() {
             frappe.prompt([

@@ -25,6 +25,11 @@ frappe.ui.form.on('Item', {
 			wcf_synchro.fenetre_composition(frm);
 		}, __('Actions'));
 
+		// La page qui compose l'image de plusieurs articles d'un coup
+		frm.add_custom_button(__("Composer des images pour plusieurs articles…"), function () {
+			frappe.set_route("composer-images");
+		}, __('Actions'));
+
 		// Ordre des images, image principale, images gardées hors du site
 		frm.add_custom_button(__("Images : ordre et site…"), function () {
 			wcf_synchro.fenetre_rangement(frm);
@@ -274,8 +279,8 @@ const wcf_synchro = {
 			size: "large",
 			fields: [
 				{ fieldtype: "HTML", fieldname: "choisies" },
-				{ fieldtype: "Link", fieldname: "article", options: "Item", label: __("Prendre des images d’un autre article"),
-					onchange: () => montrer_article(d.get_value("article")) },
+				{ fieldtype: "Data", fieldname: "recherche", label: __("Chercher un article pour prendre sa photo"),
+					description: __("Tapez un ou plusieurs mots du code, du nom ou de la marque : « frp 1035 », « runxin f65 », « bac »… Seuls les articles qui ont une image sont proposés.") },
 				{ fieldtype: "HTML", fieldname: "dispo" },
 				{ fieldtype: "Button", fieldname: "deposer", label: __("Ajouter mes propres images"), click: () => deposer() },
 				{ fieldtype: "Small Text", fieldname: "consigne", label: __("Consigne (facultatif)"),
@@ -314,22 +319,12 @@ const wcf_synchro = {
 			sources.push(x);
 			redessiner();
 		};
-		const montrer_article = (code) => {
-			const $z = d.fields_dict.dispo.$wrapper;
-			if (!code) { $z.empty(); return; }
-			frappe.call({ method: this.METHODE + "images", args: { item_code: code } }).then((r) => {
-				const images = r.message || [];
-				$z.html(images.length
-					? `<div style="color:var(--text-muted);margin-bottom:6px">${__("Cliquez sur une image pour la prendre.")}</div>` + grille(images.map((x) => vignette(x, "data-wcf-prendre", "+")).join(""))
-					: `<div style="color:var(--text-muted)">${__("Cet article n’a aucune image.")}</div>`);
-			});
-		};
+		this.brancher_recherche(d.fields_dict.recherche, d.fields_dict.dispo.$wrapper, this.METHODE, ajouter);
 		const deposer = () => new frappe.ui.FileUploader({
 			allow_multiple: true,
 			restrictions: { allowed_file_types: ["image/*"] },
 			on_success: (fichier) => ajouter({ name: fichier.name, file_url: fichier.file_url }),
 		});
-		d.$wrapper.on("click", "[data-wcf-prendre]", (ev) => ajouter({ name: $(ev.currentTarget).attr("data-wcf-prendre"), file_url: $(ev.currentTarget).attr("data-url") }));
 		d.$wrapper.on("click", "[data-wcf-retirer]", (ev) => {
 			const nom = $(ev.currentTarget).attr("data-wcf-retirer");
 			sources.splice(sources.findIndex((y) => y.name === nom), 1);
@@ -337,6 +332,54 @@ const wcf_synchro = {
 		});
 		redessiner();
 		d.show();
+	},
+
+	/**
+	 * Recherche d'un article pour prendre sa photo comme source (23/11/2026 : « la recherche des articles n'est pas
+	 * facile, lorsque je veux frp il me sort tous les articles »). On tape des mots, les articles qui ont une image
+	 * s'affichent avec leur photo ; un clic sur la photo la prend, « autres images » montre les autres.
+	 */
+	brancher_recherche(champ, $zone, methodes, prendre) {
+		const esc = frappe.utils.escape_html;
+		const carte = (a) => `
+			<div style="border:1px solid var(--border-color);border-radius:8px;padding:6px;background:var(--card-bg,#fff)">
+				<div data-wcf-prendre="${esc(a.fichier)}" data-url="${esc(a.file_url)}" data-de="${esc(a.name)}" style="cursor:pointer" title="${__("Prendre cette photo")}">
+					<img src="${esc(a.file_url)}" style="width:100%;height:104px;object-fit:contain;background:#fff;border-radius:6px" loading="lazy">
+					<div style="font-weight:700;font-size:12px;margin-top:4px">${esc(a.name)}</div>
+					<div style="font-size:11px;line-height:1.25;color:var(--text-muted);max-height:28px;overflow:hidden">${esc(a.item_name || "")}</div>
+				</div>
+				<a href="#" data-wcf-autres="${esc(a.name)}" onclick="return false" style="font-size:11px">${__("autres images")}</a>
+				<div data-wcf-autres-zone></div>
+			</div>`;
+		let attente = null, derniere = "";
+		const chercher = () => {
+			const texte = (champ.get_value() || "").trim();
+			if (texte === derniere) return;
+			derniere = texte;
+			if (texte.length < 2) { $zone.empty(); return; }
+			frappe.call({ method: methodes + "chercher_sources", args: { texte: texte } }).then((r) => {
+				if (texte !== derniere) return; // une frappe plus récente est partie entre-temps
+				const articles = r.message || [];
+				$zone.html(articles.length
+					? `<div style="color:var(--text-muted);margin:4px 0 6px">${articles.length} ${__("article(s) avec image — cliquez sur une photo pour la prendre")}</div>
+						<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:8px">${articles.map(carte).join("")}</div>`
+					: `<div style="color:var(--text-muted);margin-top:4px">${__("Aucun article avec image ne porte tous ces mots.")}</div>`);
+			});
+		};
+		champ.$input.on("input", () => { clearTimeout(attente); attente = setTimeout(chercher, 350); });
+		$zone.on("click", "[data-wcf-prendre]", (ev) => {
+			const $v = $(ev.currentTarget);
+			prendre({ name: $v.attr("data-wcf-prendre"), file_url: $v.attr("data-url"), de: $v.attr("data-de") });
+			$v.css("opacity", 0.45);
+		});
+		$zone.on("click", "[data-wcf-autres]", (ev) => {
+			const $l = $(ev.currentTarget), code = $l.attr("data-wcf-autres"), $a = $l.siblings("[data-wcf-autres-zone]");
+			frappe.call({ method: methodes + (methodes.indexOf("composition_lot") >= 0 ? "images_de" : "images"), args: { item_code: code } }).then((r) => {
+				$a.html((r.message || []).map((x) => `<img data-wcf-prendre="${esc(x.name)}" data-url="${esc(x.file_url)}" data-de="${esc(code)}" src="${esc(x.file_url)}"
+					style="width:44px;height:44px;object-fit:contain;border:1px solid var(--border-color);border-radius:6px;background:#fff;margin:4px 4px 0 0;cursor:pointer" loading="lazy">`).join(""));
+				$l.hide();
+			});
+		});
 	},
 
 	/**
