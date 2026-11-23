@@ -329,6 +329,20 @@ class TestModelesParEtape(unittest.TestCase):
 						'model_name = modele_etape("alt_model")', 'WEB_MODEL = modele_etape("web_search_model")'):
 			self.assertIn(attendu, source, attendu)
 
+	def test_les_champs_sont_aussi_dans_la_fixture(self):
+		"""La migration réimporte fixtures/ai_settings_doctype.json APRÈS les patchs : un champ absent de ce fichier
+		disparaît du réglage (vu en prod le 23/11/2026)."""
+		import json
+		from woocommerce_fusion.setup import reglages_ia as R
+		with open(os.path.join(RACINE, "fixtures", "ai_settings_doctype.json"), encoding="utf-8") as f:
+			champs = {c["fieldname"]: c for c in json.load(f)[0]["fields"]}
+		for champ in R.NOUVEAUX:
+			self.assertIn(champ, champs, champ)
+			self.assertEqual((champs[champ]["label"], champs[champ]["default"]), (R.MODELES[champ][0], R.MODELES[champ][1]), champ)
+		self.assertIn(R.SECTION[0], champs)
+		self.assertEqual(champs["open_ai_model"]["label"], R.MODELES["open_ai_model"][0])
+		self.assertEqual(champs["gemini_model"]["label"], R.GEMINI[0])
+
 	def test_reglages_poses(self):
 		from woocommerce_fusion.setup import reglages_ia as R
 		self.assertEqual(R.MODELES["open_ai_model"][1:3], ("gpt-6.2-sol", ("gpt-5.2",)))

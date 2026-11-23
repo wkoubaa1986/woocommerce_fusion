@@ -37,10 +37,10 @@
       },
       {
         "fieldname": "open_ai_model",
-        "label": "OpenAI Model",
+        "label": "Rédaction des textes du site, SEO et classement",
         "fieldtype": "Data",
-        "default": "gpt-4o-mini",
-        "description": "Example: gpt-4o-mini"
+        "default": "gpt-6.2-sol",
+        "description": "Le modèle principal. gpt-6.2-sol : 2 $ / 10 $ par million de jetons (avant : gpt-5.2, 1,75 $ / 14 $)."
       },
       {
         "fieldname": "open_ai_temperature",
@@ -49,7 +49,6 @@
         "default": "0.2",
         "description": "0 = deterministic, higher = more random"
       },
-
       {
         "fieldname": "gemini_section",
         "label": "Gemini",
@@ -62,10 +61,43 @@
       },
       {
         "fieldname": "gemini_model",
-        "label": "Gemini Model",
+        "label": "Retouche des images (Gemini)",
         "fieldtype": "Data",
         "default": "gemini-2.5-flash-image-preview",
-        "description": "Example: gemini-2.5-flash-image-preview"
+        "description": "Modèle d’image de Google. gemini-3-pro-image-preview : environ 0,13 $ par image retouchée."
+      },
+      {
+        "fieldname": "modeles_section",
+        "label": "Un modèle par étape (OpenAI)",
+        "fieldtype": "Section Break"
+      },
+      {
+        "fieldname": "web_search_model",
+        "label": "Recherche des caractéristiques sur internet",
+        "fieldtype": "Data",
+        "default": "gpt-6-luna",
+        "description": "gpt-6-luna : 0,10 $ / 0,50 $ (avant : gpt-4.1-mini, 0,40 $ / 1,60 $). Chaque recherche coûte en plus 0,01 $."
+      },
+      {
+        "fieldname": "keywords_model",
+        "label": "Choix des mots-clés",
+        "fieldtype": "Data",
+        "default": "gpt-6-luna",
+        "description": "gpt-6-luna : 0,10 $ / 0,50 $ (avant : gpt-5-mini, 0,25 $ / 2 $). Si les mots-clés déçoivent : gpt-6.1-terra (1 $ / 5 $)."
+      },
+      {
+        "fieldname": "logistics_model",
+        "label": "Poids et classe de livraison",
+        "fieldtype": "Data",
+        "default": "gpt-6-luna",
+        "description": "gpt-6-luna : 0,10 $ / 0,50 $ (avant : gpt-5-mini, 0,25 $ / 2 $)."
+      },
+      {
+        "fieldname": "alt_model",
+        "label": "Texte alternatif des images",
+        "fieldtype": "Data",
+        "default": "gpt-6-luna",
+        "description": "gpt-6-luna : 0,10 $ / 0,50 $ (avant : gpt-4o-mini, 0,15 $ / 0,60 $)."
       }
     ]
   }

@@ -12,6 +12,12 @@ Les modèles gpt-6 ont été essayés avec la clé du site : réponses JSON et r
 
 `installer()` est rejouable : il n'ajoute que ce qui manque et ne remplace une valeur que si elle est encore celle
 d'avant (un choix fait à la main dans le réglage est toujours respecté).
+
+⚠️ Les champs d'« AI Settings » doivent AUSSI être dans `fixtures/ai_settings_doctype.json` : à chaque migration,
+Frappe réimporte tous les fichiers du dossier fixtures, APRÈS les patchs. Le 23/11/2026 le patch avait ajouté les
+quatre champs en prod et la migration les a aussitôt retirés en réimportant l'ancienne définition : les valeurs
+restaient en base mais le code, ne voyant plus les champs, reprenait les anciens modèles sans rien dire. Le test
+`test_les_champs_sont_aussi_dans_la_fixture` garde les deux alignés.
 """
 import frappe
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
