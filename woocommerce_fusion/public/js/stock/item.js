@@ -366,7 +366,8 @@ const wcf_synchro = {
 			<div style="margin-bottom:10px">${__("Comparez chaque image. Cochez « Garder la retouche » seulement si elle est juste : mêmes cotes, même produit, mêmes couleurs. Une retouche non cochée est jetée, l’image actuelle reste.")}</div>
 			${props.map((p, i) => `
 				<div style="border:1px solid var(--border-color);border-radius:10px;padding:10px;margin-bottom:12px">
-					<div style="margin-bottom:8px;font-size:12.5px"><b>${__("Votre consigne")} :</b> ${p.consigne ? esc(p.consigne) : `<span style="color:var(--text-muted)">${__("aucune (retouche habituelle)")}</span>`}</div>
+					<div style="margin-bottom:8px;font-size:12.5px"><b>${__("Votre consigne")} :</b> ${p.consigne ? esc(p.consigne) : `<span style="color:var(--text-muted)">${__("aucune (retouche habituelle)")}</span>`}
+						${p.zone ? ` · <b style="color:#b91c1c">✂ ${__("zone seulement : le reste de l’image n’a pas été touché")}</b>` : ""}</div>
 					<div style="display:flex;gap:12px;align-items:flex-start">
 						${image(p.ancien_url, __("Image actuelle"))}
 						${image(p.proposition_url, __("Retouche proposée"))}
@@ -422,14 +423,15 @@ const wcf_synchro = {
 						return;
 					}
 					d.hide();
-					const consignes = {};
+					const consignes = {}, zones = {};
 					fichiers.forEach((f) => {
 						const texte = (d.$wrapper.find(`[data-wcf-consigne="${f}"]`).val() || "").trim();
 						if (texte) consignes[f] = texte;
+						if (d._wcf_zones[f]) zones[f] = d._wcf_zones[f];
 					});
 					this.enregistrer_puis(frm, () => frappe.call({
 						method: this.METHODE + "lancer_retouche",
-						args: { item_code: frm.doc.name, fichiers: fichiers, consignes: consignes, synchroniser: v.synchroniser ? 1 : 0 },
+						args: { item_code: frm.doc.name, fichiers: fichiers, consignes: consignes, zones: zones, synchroniser: v.synchroniser ? 1 : 0 },
 					}).then((r2) => this.parti(frm, r2.message)));
 				},
 			});
@@ -452,10 +454,80 @@ const wcf_synchro = {
 						${im.avant_url ? `<div style="font-size:11px"><a href="${esc(im.avant_url)}" target="_blank" title="${__("Voir l’image d’avant la retouche")}">↩ ${__("image d’avant disponible")}</a></div>` : ""}
 						<textarea class="form-control" data-wcf-consigne="${esc(im.name)}" rows="2" maxlength="600"
 							placeholder="${__("Consigne pour cette image (facultatif)")}" style="margin-top:6px;font-size:12px;min-height:52px"></textarea>
+						<button class="btn btn-xs btn-default" data-wcf-zone="${esc(im.name)}" data-wcf-url="${esc(im.file_url)}"
+							style="margin-top:6px;width:100%" title="${__("Tracer un rectangle : seule cette partie de l’image sera retouchée")}">✂ ${__("Retoucher seulement une zone…")}</button>
 					</div>`).join("")}
 				</div>`);
+			d._wcf_zones = {};
+			d.fields_dict.choix.$wrapper.on("click", "[data-wcf-zone]", (ev) => {
+				ev.preventDefault();
+				const $b = $(ev.currentTarget), nom = $b.attr("data-wcf-zone");
+				this.choisir_zone($b.attr("data-wcf-url"), d._wcf_zones[nom], (zone) => {
+					if (zone) d._wcf_zones[nom] = zone; else delete d._wcf_zones[nom];
+					$b.text(zone ? "✂ " + __("Zone choisie — la modifier") : "✂ " + __("Retoucher seulement une zone…"))
+						.toggleClass("btn-primary", !!zone).toggleClass("btn-default", !zone);
+					if (zone) d.$wrapper.find(`[data-wcf-image="${nom}"]`).prop("checked", true);
+				});
+			});
 			d.show();
 		});
+	},
+
+	/**
+	 * Choisir une zone sur une image (23/11/2026 : « sélectionner une zone et donner une consigne claire, là-dedans, à
+	 * améliorer »). On trace un rectangle à la souris ou au doigt ; la zone est rendue en parts de l'image
+	 * [x, y, largeur, hauteur], ou null pour « toute l'image ».
+	 */
+	choisir_zone(url, zone, suite) {
+		const esc = frappe.utils.escape_html;
+		let choix = zone || null;
+		const d = new frappe.ui.Dialog({
+			title: __("Tracer la zone à retoucher"),
+			size: "large",
+			fields: [{ fieldtype: "HTML", fieldname: "toile" }],
+			primary_action_label: __("Utiliser cette zone"),
+			primary_action: () => {
+				if (!choix) {
+					frappe.show_alert({ message: __("Tracez d’abord un rectangle sur l’image."), indicator: "orange" }, 4);
+					return;
+				}
+				d.hide();
+				suite(choix);
+			},
+			secondary_action_label: __("Toute l’image"),
+			secondary_action: () => { d.hide(); suite(null); },
+		});
+		d.fields_dict.toile.$wrapper.html(`
+			<div style="margin-bottom:8px;color:var(--text-muted)">${__("Tracez un rectangle autour de ce qu’il faut améliorer. Le reste de l’image ne sera pas touché.")}</div>
+			<div style="text-align:center">
+				<div data-wcf-toile style="position:relative;display:inline-block;user-select:none;touch-action:none;cursor:crosshair;line-height:0">
+					<img src="${esc(url)}" draggable="false" style="max-width:100%;max-height:65vh;display:block">
+					<div data-wcf-rect style="position:absolute;border:2px dashed #dc2626;background:rgba(220,38,38,.14);display:none;pointer-events:none"></div>
+				</div>
+			</div>`);
+		const $toile = d.fields_dict.toile.$wrapper.find("[data-wcf-toile]");
+		const $rect = $toile.find("[data-wcf-rect]");
+		const dessiner = (z) => {
+			if (!z) { $rect.hide(); return; }
+			$rect.css({ left: z[0] * 100 + "%", top: z[1] * 100 + "%", width: z[2] * 100 + "%", height: z[3] * 100 + "%" }).show();
+		};
+		let depart = null;
+		const point = (ev) => {
+			const r = $toile[0].getBoundingClientRect();
+			return [Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width)), Math.min(1, Math.max(0, (ev.clientY - r.top) / r.height))];
+		};
+		$toile.on("pointerdown", (ev) => { depart = point(ev.originalEvent); $toile[0].setPointerCapture(ev.originalEvent.pointerId); ev.preventDefault(); });
+		$toile.on("pointermove", (ev) => {
+			if (!depart) return;
+			const p = point(ev.originalEvent);
+			const z = [Math.min(depart[0], p[0]), Math.min(depart[1], p[1]), Math.abs(p[0] - depart[0]), Math.abs(p[1] - depart[1])];
+			choix = (z[2] >= 0.03 && z[3] >= 0.03) ? z.map((v) => Math.round(v * 10000) / 10000) : null;
+			dessiner(z);
+		});
+		$toile.on("pointerup pointercancel", () => { depart = null; dessiner(choix); });
+		d.show();
+		// l'image doit être posée avant de dessiner une zone déjà choisie
+		setTimeout(() => dessiner(choix), 300);
 	},
 };
 window.wcf_synchro = wcf_synchro;

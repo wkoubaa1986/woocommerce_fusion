@@ -383,5 +383,64 @@ class TestRangementDesImages(unittest.TestCase):
 		self.assertIn('__("Images : ordre et site…")', js)
 
 
+
+class TestRetoucheDUneZone(unittest.TestCase):
+	"""« Sélectionner une zone et donner une consigne claire, là-dedans, à améliorer » (23/11/2026)."""
+
+	def test_zone_valide(self):
+		self.assertEqual(C.zone_valide([0.1, 0.2, 0.3, 0.4]), (0.1, 0.2, 0.3, 0.4))
+		self.assertEqual(C.zone_valide(["0.8", 0.9, 0.5, 0.5]), (0.8, 0.9, 0.2, 0.1))        # bornée à l'image
+		self.assertIsNone(C.zone_valide([0.1, 0.1, 0.01, 0.5]))                                # trop petite
+		self.assertIsNone(C.zone_valide([0, 0, 1, 1]))                                         # toute l'image
+		self.assertIsNone(C.zone_valide("n'importe quoi"))
+		self.assertIsNone(C.zone_valide(None))
+
+	def test_boites(self):
+		zone, envoi = C.boites_de_zone((0.25, 0.25, 0.5, 0.5), 2000, 2000)
+		self.assertEqual(zone, (500, 500, 1500, 1500))
+		self.assertEqual(envoi, (380, 380, 1620, 1620))                    # 12 % de marge autour
+		_zone, envoi = C.boites_de_zone((0.0, 0.0, 0.5, 0.5), 2000, 2000)
+		self.assertEqual(envoi[:2], (0, 0))                                 # jamais hors de l'image
+
+	def test_hors_de_la_zone_l_image_reste_identique_au_pixel_pres(self):
+		origine = Image.new("RGB", (400, 300), (10, 120, 200))
+		retouche = Image.new("RGB", (512, 512), (250, 20, 20))             # ce que l'IA rend : un carré tout rouge
+		zone = (0.5, 0.5, 0.25, 0.3)
+		resultat = C.recoller_zone(origine, retouche, zone)
+		self.assertEqual(resultat.size, origine.size)
+		(g, h, d, b), (eg, eh, ed, eb) = C.boites_de_zone(zone, 400, 300)
+		self.assertEqual(resultat.getpixel(((g + d) // 2, (h + b) // 2)), (250, 20, 20))       # le cœur de la zone a changé
+		for point in ((5, 5), (399, 5), (5, 299), (eg - 2, eh - 2), (g // 2, h // 2)):          # loin de la zone : rien
+			self.assertEqual(resultat.getpixel(point), (10, 120, 200), point)
+
+	def test_la_retouche_de_zone_rend_l_image_entiere(self):
+		client = mock.Mock()
+		client.models.generate_content.return_value = _Reponse(_image((250, 20, 20), (64, 64)))
+		octets, ok, raison, journal = C._retouche_zone_pure(client, "modele", "enlève la tache", _image((10, 120, 200), (300, 300)), (0.4, 0.4, 0.2, 0.2))
+		self.assertTrue(ok)
+		sortie = Image.open(io.BytesIO(octets)).convert("RGB")
+		self.assertEqual(sortie.size, (2000, 2000))
+		coin = sortie.getpixel((20, 20))
+		self.assertTrue(abs(coin[0] - 10) < 12 and abs(coin[2] - 200) < 12, coin)               # le coin est resté bleu
+		envoye, demande = client.models.generate_content.call_args.kwargs["contents"]
+		self.assertEqual(envoye.width, envoye.height)                                           # la zone part au carré
+		self.assertLess(envoye.width, 300)                                                      # la zone seulement
+		self.assertIn("enlève la tache", demande)
+		self.assertIn("Only this area must be improved", demande)
+
+	def test_zone_sans_consigne(self):
+		client = mock.Mock()
+		client.models.generate_content.return_value = _Reponse(_image())
+		C._retouche_zone_pure(client, "modele", "", _image((1, 2, 3), (200, 200)), (0.1, 0.1, 0.5, 0.5))
+		self.assertIn(C.CONSIGNE_ZONE_DEFAUT, client.models.generate_content.call_args.kwargs["contents"][1])
+
+	def test_la_fenetre_trace_la_zone(self):
+		with open(os.path.join(RACINE, "public", "js", "stock", "item.js"), encoding="utf-8") as f:
+			js = f.read()
+		self.assertIn("choisir_zone(url, zone, suite)", js)
+		self.assertIn("zones: zones", js)
+		self.assertIn("pointerdown", js)
+
+
 if __name__ == "__main__":
 	unittest.main()

@@ -256,7 +256,7 @@ def _images_choisies(item_code: str, fichiers) -> list:
 
 
 @frappe.whitelist()
-def lancer_retouche(item_code: str, fichiers, consignes=None, synchroniser: int | str = 1) -> dict:
+def lancer_retouche(item_code: str, fichiers, consignes=None, synchroniser: int | str = 1, zones=None) -> dict:
     """Retouche manuelle, premier temps : les images choisies repassent à l'IA (traitées ou non), chacune avec SA
     consigne (`consignes` = {nom du fichier: texte}, facultatif). Rien n'est remplacé : le résultat attend sa
     validation (`valider_retouches`)."""
@@ -264,13 +264,16 @@ def lancer_retouche(item_code: str, fichiers, consignes=None, synchroniser: int 
     fichiers = _images_choisies(item_code, fichiers)
     consignes = frappe.parse_json(consignes) if isinstance(consignes, str) else dict(consignes or {})
     consignes = {f: str(consignes.get(f) or "").strip() for f in fichiers if str(consignes.get(f) or "").strip()}
+    # une zone par image, facultative : (x, y, largeur, hauteur) en parts de l'image — seule cette partie est retouchée
+    zones = frappe.parse_json(zones) if isinstance(zones, str) else dict(zones or {})
+    zones = {f: list(zones[f]) for f in fichiers if zones.get(f)}
     occupe = _occupe(item_code)
     if occupe:
         return occupe
     _jeter_les_propositions(item_code)
     return _mettre_en_file(item_code, "retouche", ["retouche"], "executer_propositions",
                            en_plus={"synchroniser": cint(cint(synchroniser) and _a_un_site(item_code))},
-                           fichiers=fichiers, consignes=consignes)
+                           fichiers=fichiers, consignes=consignes, zones=zones)
 
 
 @frappe.whitelist()
@@ -357,11 +360,11 @@ def executer(item_code: str) -> None:
     _travailler(item_code, lambda: run_item_sync(item_code=item_code) and None)
 
 
-def executer_propositions(item_code: str, fichiers: list, consignes: dict | None = None) -> None:
+def executer_propositions(item_code: str, fichiers: list, consignes: dict | None = None, zones: dict | None = None) -> None:
     from woocommerce_fusion.integrations.content_enrichment import proposer_retouches
 
     def travail():
-        propositions, echecs = proposer_retouches(item_code, fichiers, consignes)
+        propositions, echecs = proposer_retouches(item_code, fichiers, consignes, zones)
         if echecs:
             avertir("%d image(s) non retouchée(s) : %s. Elles restent telles qu’elles étaient." % (len(echecs), echecs[0]))
         if not propositions:

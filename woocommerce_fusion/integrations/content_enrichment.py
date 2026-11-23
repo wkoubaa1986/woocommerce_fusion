@@ -2441,6 +2441,116 @@ def _retouche_pure(client, modele: str, demande: str, img_bytes: bytes) -> tuple
     return _pil_to_webp_square_bytes(base_im, size=(2000, 2000), quality=88), False, raison_echec_retouche(derniere), journal
 
 
+# ---------------------------------------------------------------------------
+# Retouche d'une ZONE (23/11/2026 : « sélectionner une zone et donner une consigne claire, là-dedans, à améliorer »)
+# ---------------------------------------------------------------------------
+# Seule la zone part chez Gemini (avec une petite marge autour, pour qu'il voie le contexte) ; le résultat est recollé
+# à sa place sur l'image d'origine. Hors de la zone, l'image reste identique au pixel près : une retouche locale ne
+# peut plus changer une couleur ou une cote ailleurs.
+ZONE_MARGE = 0.12            # marge envoyée autour de la zone, en part de sa taille
+ZONE_MIN = 0.03              # une zone plus petite que 3 % du côté n'en est pas une
+ZONE_FONDU = 6               # pixels de fondu au bord de la zone, pour ne pas voir le raccord
+
+ZONE_PROMPT = (
+    """You receive a CROP taken from a product image used on a professional e-commerce website.
+Only this area must be improved. Your result will be pasted back at exactly the same place in the original image.
+
+Instruction from the shop owner for this area (it may be written in French):
+\"\"\"{consigne}\"\"\"
+
+Rules:
+- Keep EXACTLY the same framing, scale and position of every element: nothing may move, be resized, rotated or
+  cropped, so that your result lines up with the original at its borders.
+- Change only what the instruction asks for.
+- Do NOT change the product, its colors or its materials, unless the instruction explicitly asks for it.
+- NEVER add dimension lines, numbers, labels or text that are not in the original, and NEVER alter existing numbers,
+  unless the instruction explicitly asks for it.
+- White bands around the crop, if any, are padding: keep them pure white.
+
+Return ONE image only, with the same composition. Do not return any text."""
+)
+CONSIGNE_ZONE_DEFAUT = "Améliore la netteté et la propreté de cette zone, sans rien changer à son contenu."
+
+
+def zone_valide(zone) -> tuple | None:
+    """(x, y, l, h) en parts de l'image, bornées à [0, 1] ; None si ce n'est pas une zone utilisable. Pure."""
+    try:
+        x, y, l, h = (float(v) for v in zone)
+    except Exception:
+        return None
+    x, y = min(max(x, 0.0), 1.0), min(max(y, 0.0), 1.0)
+    l, h = min(l, 1.0 - x), min(h, 1.0 - y)
+    if l < ZONE_MIN or h < ZONE_MIN:
+        return None
+    if l > 0.98 and h > 0.98:
+        return None            # toute l'image : ce n'est plus une retouche de zone
+    return (round(x, 4), round(y, 4), round(l, 4), round(h, 4))
+
+
+def boites_de_zone(zone: tuple, largeur: int, hauteur: int) -> tuple:
+    """La zone en pixels, et la boîte un peu plus large envoyée à l'IA : ((g, h, d, b), (g, h, d, b)). Pure."""
+    x, y, l, h = zone
+    g, ht = int(round(x * largeur)), int(round(y * hauteur))
+    d, b = int(round((x + l) * largeur)), int(round((y + h) * hauteur))
+    mx, my = max(16, int((d - g) * ZONE_MARGE)), max(16, int((b - ht) * ZONE_MARGE))
+    return (g, ht, d, b), (max(0, g - mx), max(0, ht - my), min(largeur, d + mx), min(hauteur, b + my))
+
+
+def recoller_zone(origine, retouche_carree, zone: tuple):
+    """Recolle sur `origine` la zone retouchée. `retouche_carree` est ce que l'IA a rendu pour la boîte envoyée,
+    mise au carré sur fond blanc. Hors de la zone (et de quelques pixels de fondu), `origine` n'est pas touchée. Pure."""
+    from PIL import ImageDraw, ImageFilter
+
+    (g, h, d, b), (eg, eh, ed, eb) = boites_de_zone(zone, origine.width, origine.height)
+    el, eht = ed - eg, eb - eh
+    cote = max(el, eht)
+    # la boîte envoyée était centrée dans un carré blanc : on la retrouve au même endroit dans la réponse
+    rendu = retouche_carree.convert("RGB").resize((cote, cote), Image.LANCZOS)
+    dx, dy = (cote - el) // 2, (cote - eht) // 2
+    boite = rendu.crop((dx, dy, dx + el, dy + eht))
+    masque = Image.new("L", (el, eht), 0)
+    ImageDraw.Draw(masque).rectangle((g - eg, h - eh, d - eg - 1, b - eh - 1), fill=255)
+    masque = masque.filter(ImageFilter.GaussianBlur(ZONE_FONDU))
+    resultat = origine.convert("RGB").copy()
+    resultat.paste(boite, (eg, eh), masque)
+    return resultat
+
+
+def _retouche_zone_pure(client, modele: str, consigne: str, img_bytes: bytes, zone: tuple) -> tuple:
+    """Comme `_retouche_pure`, pour une zone : (octets WEBP carrés 2000×2000, réussie, raison, à journaliser).
+    Ne touche à rien de Frappe."""
+    import traceback
+
+    origine = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    _zone, envoi = boites_de_zone(zone, origine.width, origine.height)
+    boite = origine.crop(envoi)
+    cote = max(boite.width, boite.height)
+    carre = Image.new("RGB", (cote, cote), (255, 255, 255))
+    carre.paste(boite, ((cote - boite.width) // 2, (cote - boite.height) // 2))
+    demande = ZONE_PROMPT.format(consigne=" ".join((consigne or "").split())[:CONSIGNE_MAX] or CONSIGNE_ZONE_DEFAUT)
+    journal, derniere = [], None
+    essais = [c for c in (_config_retouche(), None)]
+    if essais[0] is None:
+        essais = [None]
+    for config in essais:
+        try:
+            if config is not None:
+                resp = client.models.generate_content(model=modele, contents=[carre, demande], config=config)
+            else:
+                resp = client.models.generate_content(model=modele, contents=[carre, demande])
+            image = _image_de_la_reponse(resp)
+            if image is not None:
+                return _pil_to_webp_square_bytes(recoller_zone(origine, image, zone), size=(2000, 2000), quality=90), True, "", journal
+            derniere = "aucune image renvoyée"
+            journal.append(("gemini image edit: no image returned", "retouche de zone : aucune image"))
+        except Exception as e:
+            derniere = str(e)
+            if config is None or not ("400" in derniere or "INVALID_ARGUMENT" in derniere):
+                journal.append(("gemini image edit failed", traceback.format_exc()))
+                break
+    return _pil_to_webp_square_bytes(origine, size=(2000, 2000), quality=88), False, raison_echec_retouche(derniere), journal
+
+
 def _gemini_retoucher(client: genai.Client, img_bytes: bytes, consigne: str | None = None) -> tuple:
     """Retouche une image. Renvoie (octets WEBP carrés 2000×2000, réussie, raison de l'échec).
     `consigne` : ce que l'utilisateur demande en plus pour cette image (retouche manuelle)."""
@@ -3333,7 +3443,7 @@ def enregistrer_rangement(item_name: str, ordre: list, hors_site: list) -> dict:
     return {"ok": True, "item": item_name, "principale": principale, "images": len(ordre), "hors_site": len(hors_site)}
 
 
-def proposer_retouches(item_name: str, fichiers: list, consignes: dict | None = None) -> tuple:
+def proposer_retouches(item_name: str, fichiers: list, consignes: dict | None = None, zones: dict | None = None) -> tuple:
     """Retouche manuelle, premier temps : les images choisies passent à l'IA (plusieurs en même temps) et le résultat
     est mis de côté comme PROPOSITION — rien n'est remplacé, rien ne part sur le site.
 
@@ -3344,6 +3454,8 @@ def proposer_retouches(item_name: str, fichiers: list, consignes: dict | None = 
     `consignes` : {nom du fichier: consigne}. UNE consigne PAR image (« est-ce que je peux faire une consigne par
     image ? ») : la consigne unique appliquée à toutes les images cochées est ce qui avait fait dessiner des cotes sur
     une photo qui n'en avait pas. Une image sans consigne reçoit la retouche habituelle.
+    `zones` : {nom du fichier: (x, y, largeur, hauteur) en parts de l'image}. Avec une zone, seule cette partie de
+    l'image est retouchée ; le reste est recollé tel quel.
 
     Renvoie (propositions, raisons des échecs)."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -3352,6 +3464,8 @@ def proposer_retouches(item_name: str, fichiers: list, consignes: dict | None = 
     client = _get_gemini_client()
     modele = _read_gemini_model(purpose="image")
     consignes = consignes or {}
+    zones = {nom: zone_valide(z) for nom, z in (zones or {}).items()}
+    zones = {nom: z for nom, z in zones.items() if z}
     travaux, echecs = [], []
     for nom in fichiers:
         doc = frappe.get_doc("File", nom)
@@ -3364,7 +3478,8 @@ def proposer_retouches(item_name: str, fichiers: list, consignes: dict | None = 
         suivi.etape("retouche", "0 sur %d prête(s)" % len(travaux))
         # Les appels à Google partent ensemble ; tout ce qui touche à la base reste dans ce fil-ci.
         with ThreadPoolExecutor(max_workers=min(RETOUCHES_EN_PARALLELE, len(travaux))) as fils:
-            futurs = {fils.submit(_retouche_pure, client, modele, consigne_complete(consignes.get(nom)), octets): nom
+            futurs = {(fils.submit(_retouche_zone_pure, client, modele, consignes.get(nom), octets, zones[nom]) if nom in zones
+                       else fils.submit(_retouche_pure, client, modele, consigne_complete(consignes.get(nom)), octets)): nom
                       for nom, _url, octets in travaux}
             for n, futur in enumerate(as_completed(futurs), start=1):
                 resultats[futurs[futur]] = futur.result()
@@ -3383,7 +3498,8 @@ def proposer_retouches(item_name: str, fichiers: list, consignes: dict | None = 
                                 "content": octets, "is_private": 0})
         fiche.insert(ignore_permissions=True)
         propositions.append({"ancien": nom, "ancien_url": url, "proposition": fiche.name, "proposition_url": fiche.file_url,
-                             "consigne": " ".join((consignes.get(nom) or "").split())[:CONSIGNE_MAX]})
+                             "consigne": " ".join((consignes.get(nom) or "").split())[:CONSIGNE_MAX],
+                             "zone": list(zones[nom]) if nom in zones else None})
     frappe.db.commit()
     return propositions, echecs
 
