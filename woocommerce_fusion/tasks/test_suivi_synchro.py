@@ -336,5 +336,52 @@ class TestModelesParEtape(unittest.TestCase):
 		self.assertEqual(set(R.NOUVEAUX), set(C.MODELES_PAR_ETAPE))
 
 
+
+class TestRangementDesImages(unittest.TestCase):
+	"""Ordre des images, image principale, images gardées hors du site (demandes du 23/11/2026)."""
+
+	def test_sans_rang_rien_ne_change(self):
+		self.assertIsNone(C.ranger([{"name": "a", "creation": "2026-01-01"}, {"name": "b", "custom_ordre_image": 0}]))
+
+	def test_l_ordre_choisi_fait_foi(self):
+		rows = [{"name": "a", "custom_ordre_image": 3, "creation": "2026-01-01"}, {"name": "b", "custom_ordre_image": 1, "creation": "2026-03-01"},
+				{"name": "c", "custom_ordre_image": 2, "creation": "2026-02-01"}]
+		self.assertEqual([r["name"] for r in C.ranger(rows)], ["b", "c", "a"])
+
+	def test_une_image_jamais_rangee_suit_les_autres_par_date(self):
+		rows = [{"name": "nouvelle2", "creation": "2026-11-02"}, {"name": "a", "custom_ordre_image": 1, "creation": "2026-01-01"},
+				{"name": "nouvelle1", "custom_ordre_image": 0, "creation": "2026-11-01"}]
+		self.assertEqual([r["name"] for r in C.ranger(rows)], ["a", "nouvelle1", "nouvelle2"])
+
+	def test_l_ordre_choisi_passe_avant_l_image_principale_d_origine(self):
+		it = mock.Mock(image="/files/x.jpg")
+		rows = [{"name": "x", "file_url": "/files/x.jpg", "attached_to_field": "image", "custom_ordre_image": 2, "creation": "1"},
+				{"name": "y", "file_url": "/files/y.jpg", "custom_ordre_image": 1, "creation": "2"}]
+		self.assertEqual([r["name"] for r in C._make_main_first(it, rows)], ["y", "x"])
+		# sans rang : comme avant, l'image principale d'abord
+		sans = [{"name": "y", "file_url": "/files/y.jpg"}, {"name": "x", "file_url": "/files/x.jpg", "attached_to_field": "image"}]
+		self.assertEqual([r["name"] for r in C._make_main_first(it, sans)], ["x", "y"])
+
+	def test_la_synchronisation_suit_l_ordre_et_ecarte_les_images_hors_site(self):
+		import inspect
+		from woocommerce_fusion.tasks import sync_items
+		source = inspect.getsource(sync_items._upload_item_images_to_wp_and_attach)
+		self.assertIn("ranges = ranger(rows)", source)
+		self.assertIn('if int(f.get("custom_hors_site") or 0) == 1:\n            continue', source)
+
+	def test_une_retouche_garde_le_rang_de_l_image_qu_elle_remplace(self):
+		import inspect
+		self.assertIn("for champ in champs_de_rangement():\n        setattr(new_doc, champ, old_doc.get(champ) or 0)",
+					  inspect.getsource(C._remplacer_par_retouche))
+		self.assertEqual((C.CHAMP_ORDRE, C.CHAMP_HORS_SITE), ("custom_ordre_image", "custom_hors_site"))
+
+	def test_la_fenetre_existe(self):
+		with open(os.path.join(RACINE, "public", "js", "stock", "item.js"), encoding="utf-8") as f:
+			js = f.read()
+		self.assertIn('this.METHODE + "enregistrer_images"', js)
+		self.assertIn("data-wcf-hors", js)
+		self.assertIn('__("Images : ordre et site…")', js)
+
+
 if __name__ == "__main__":
 	unittest.main()

@@ -308,6 +308,24 @@ def restaurer(item_code: str, fichiers, synchroniser: int | str = 1) -> dict:
                            fichiers=fichiers, synchroniser=synchroniser)
 
 
+@frappe.whitelist()
+def enregistrer_images(item_code: str, ordre, hors_site=None, synchroniser: int | str = 1) -> dict:
+    """Fenêtre « Images : ordre et site » : l'ordre des images (la première devient l'image principale), celles qui
+    ne partent pas sur le site, puis la synchronisation de l'article si demandée."""
+    item = _article(item_code)
+    occupe = _occupe(item_code)
+    if occupe:
+        return occupe
+    from woocommerce_fusion.integrations.content_enrichment import enregistrer_rangement
+    ordre = frappe.parse_json(ordre) if isinstance(ordre, str) else list(ordre or [])
+    hors_site = frappe.parse_json(hors_site) if isinstance(hors_site, str) else list(hors_site or [])
+    resultat = enregistrer_rangement(item_code, ordre, hors_site)
+    if cint(synchroniser) and _a_un_site(item_code):
+        _jeter_les_propositions(item_code)
+        return _mettre_en_file(item_code, "synchro", etapes_prevues(item), "executer")
+    return dict(resultat, enregistre=1)
+
+
 # ── le travail, dans la file ─────────────────────────────────────────────────
 def _travailler(item_code: str, travail) -> None:
     """`travail()` peut renvoyer de quoi compléter l'état final (par défaut : « terminée »)."""

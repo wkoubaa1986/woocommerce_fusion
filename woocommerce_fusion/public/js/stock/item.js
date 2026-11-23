@@ -20,6 +20,11 @@ frappe.ui.form.on('Item', {
 			frm.trigger("sync_item_images");
 		}, __('Actions'));
 
+		// Ordre des images, image principale, images gardées hors du site
+		frm.add_custom_button(__("Images : ordre et site…"), function () {
+			wcf_synchro.fenetre_rangement(frm);
+		}, __('Actions'));
+
 		// Où en est la synchronisation de cet article avec le site (en cours, terminée, échouée)
 		wcf_synchro.suivre(frm);
 	},
@@ -250,6 +255,85 @@ const wcf_synchro = {
 	},
 
 	/**
+	 * « Images : ordre et site » (23/11/2026 : « l'ordre des images, même l'image principale, est-ce que je peux le
+	 * changer dans l'article et par conséquent sur le site » ; « sélectionner des images qui ne seront pas poussées sur
+	 * le site »). Les flèches déplacent une image ; la première est l'image principale ; une case par image l'écarte
+	 * du site.
+	 */
+	fenetre_rangement(frm) {
+		const esc = frappe.utils.escape_html;
+		frappe.call({ method: this.METHODE + "images", args: { item_code: frm.doc.name } }).then((r) => {
+			const images = r.message || [];
+			if (!images.length) {
+				frappe.msgprint(__("Cet article n’a aucune image jointe."));
+				return;
+			}
+			const d = new frappe.ui.Dialog({
+				title: __("Images : ordre et site"),
+				size: "large",
+				fields: [
+					{ fieldtype: "HTML", fieldname: "liste" },
+					{ fieldtype: "Check", fieldname: "synchroniser", label: __("Puis envoyer l’article sur le site"), default: 1 },
+				],
+				primary_action_label: __("Enregistrer"),
+				primary_action: (v) => {
+					const $t = d.$wrapper.find("[data-wcf-rang]");
+					const ordre = $t.map((i, el) => $(el).attr("data-wcf-rang")).get();
+					const hors = $t.filter((i, el) => $(el).find("[data-wcf-hors]").is(":checked")).map((i, el) => $(el).attr("data-wcf-rang")).get();
+					d.hide();
+					this.enregistrer_puis(frm, () => frappe.call({
+						method: this.METHODE + "enregistrer_images",
+						args: { item_code: frm.doc.name, ordre: ordre, hors_site: hors, synchroniser: v.synchroniser ? 1 : 0 },
+					}).then((r2) => {
+						const e = r2.message || {};
+						if (e.enregistre) {
+							frappe.show_alert({ message: __("Ordre des images enregistré."), indicator: "green" }, 5);
+							frm.reload_doc();
+						} else this.parti(frm, e);
+					}));
+				},
+			});
+			const $liste = d.fields_dict.liste.$wrapper;
+			$liste.html(`
+				<div style="margin-bottom:8px;color:var(--text-muted)">${__("Déplacez les images avec les flèches. La première est l’image principale de l’article et du produit sur le site. Cochez « Pas sur le site » pour garder une image dans ERPNext sans l’envoyer.")}</div>
+				<div data-wcf-grille style="display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px">
+				${images.map((im) => `
+					<div data-wcf-rang="${esc(im.name)}" style="border:1px solid var(--border-color);border-radius:10px;padding:8px">
+						<div data-wcf-place style="font-size:11.5px;font-weight:700;margin-bottom:4px"></div>
+						<div style="height:140px;display:flex;align-items:center;justify-content:center;background:#fff;border-radius:6px;overflow:hidden">
+							<img src="${esc(im.file_url)}" style="max-width:100%;max-height:140px" loading="lazy">
+						</div>
+						<div style="display:flex;gap:6px;margin-top:6px">
+							<button class="btn btn-xs btn-default" data-wcf-vers="-1" title="${__("Avancer")}" style="flex:1">◀</button>
+							<button class="btn btn-xs btn-default" data-wcf-vers="1" title="${__("Reculer")}" style="flex:1">▶</button>
+							<button class="btn btn-xs btn-default" data-wcf-vers="0" title="${__("Mettre en image principale")}" style="flex:1">⭐</button>
+						</div>
+						<label style="display:flex;align-items:center;gap:6px;margin:6px 0 0;font-size:12px;cursor:pointer">
+							<input type="checkbox" data-wcf-hors ${im.hors_site ? "checked" : ""} style="margin:0"> ${__("Pas sur le site")}
+						</label>
+					</div>`).join("")}
+				</div>`);
+			const numeroter = () => $liste.find("[data-wcf-rang]").each((i, el) => {
+				const hors = $(el).find("[data-wcf-hors]").is(":checked");
+				$(el).css("opacity", hors ? 0.55 : 1);
+				$(el).find("[data-wcf-place]").text(i === 0 ? "⭐ " + __("1 · image principale") : String(i + 1))
+					.css("color", i === 0 ? "#166534" : "var(--text-muted)");
+			});
+			$liste.on("click", "[data-wcf-vers]", (ev) => {
+				const $c = $(ev.currentTarget).closest("[data-wcf-rang]");
+				const sens = parseInt($(ev.currentTarget).attr("data-wcf-vers"), 10);
+				if (sens === 0) $c.parent().prepend($c);
+				else if (sens < 0 && $c.prev().length) $c.insertBefore($c.prev());
+				else if (sens > 0 && $c.next().length) $c.insertAfter($c.next());
+				numeroter();
+			});
+			$liste.on("change", "[data-wcf-hors]", numeroter);
+			numeroter();
+			d.show();
+		});
+	},
+
+	/**
 	 * Contrôle avant (23/11/2026, après une retouche fausse partie directement sur le site) : chaque retouche est
 	 * montrée à côté de l'image actuelle ; rien n'est remplacé tant que l'utilisateur n'a pas coché « garder ».
 	 */
@@ -363,6 +447,7 @@ const wcf_synchro = {
 							<span style="font-size:11.5px;font-weight:600;color:${im.traitee ? "#166534" : "#9a3412"}">${im.traitee ? "✓ " + __("traitée par l’IA") : __("pas encore traitée")}</span>
 						</div>
 						${im.principale ? `<div style="font-size:11px;color:var(--text-muted)">${__("image principale")}</div>` : ""}
+						${im.hors_site ? `<div style="font-size:11px;color:#9a3412">${__("pas sur le site")}</div>` : ""}
 						</label>
 						${im.avant_url ? `<div style="font-size:11px"><a href="${esc(im.avant_url)}" target="_blank" title="${__("Voir l’image d’avant la retouche")}">↩ ${__("image d’avant disponible")}</a></div>` : ""}
 						<textarea class="form-control" data-wcf-consigne="${esc(im.name)}" rows="2" maxlength="600"

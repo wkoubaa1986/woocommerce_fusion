@@ -83,12 +83,21 @@ def _valeurs() -> dict:
 
 
 def _champ_image_avant() -> None:
-    """Sur la fiche Fichier : le fichier que celui-ci a remplacé (« Revenir à l'image d'avant »)."""
+    """Sur la fiche Fichier : le fichier que celui-ci a remplacé (« Revenir à l'image d'avant »), son rang sur
+    l'article et « ne pas envoyer sur le site »."""
     apres = "custom_treated_ai" if frappe.db.has_column("File", "custom_treated_ai") else "file_url"
-    create_custom_fields({"File": [{
-        "fieldname": "custom_image_avant", "label": "Image d’avant la retouche", "fieldtype": "Data",
-        "insert_after": apres, "read_only": 1, "no_copy": 1,
-        "description": "Le fichier que cette image retouchée a remplacé. Rempli tout seul."}]}, update=True)
+    create_custom_fields({"File": [
+        {"fieldname": "custom_image_avant", "label": "Image d’avant la retouche", "fieldtype": "Data",
+         "insert_after": apres, "read_only": 1, "no_copy": 1,
+         "description": "Le fichier que cette image retouchée a remplacé. Rempli tout seul."},
+        # Rangement des images d'un article (fenêtre « Images : ordre et site » de la fiche article).
+        {"fieldname": "custom_ordre_image", "label": "Rang de l’image sur l’article", "fieldtype": "Int",
+         "insert_after": "custom_image_avant", "no_copy": 1,
+         "description": "1 = image principale. 0 = jamais rangée. Se règle depuis la fiche article."},
+        {"fieldname": "custom_hors_site", "label": "Ne pas envoyer sur le site", "fieldtype": "Check",
+         "insert_after": "custom_ordre_image", "no_copy": 1,
+         "description": "L’image reste dans ERPNext et n’est pas envoyée sur le site. Se règle depuis la fiche article."},
+    ]}, update=True)
 
 
 def installer() -> dict:

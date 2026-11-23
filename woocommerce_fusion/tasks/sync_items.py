@@ -31,6 +31,7 @@ from woocommerce_fusion.integrations import wp_media
 from woocommerce_fusion.tasks import suivi_synchro as suivi
 from woocommerce_fusion.integrations.content_enrichment import generate_website_contenant, classify_item_group, retouch_item_images, classify_item_collections, treat_left_item_images
 from woocommerce_fusion.integrations.item_images_treatment import dedupe_item_images, _is_image_url as _is_image_url_shared
+from woocommerce_fusion.integrations.content_enrichment import champs_de_rangement, ranger
 
 from typing import List
 import posixpath
@@ -291,12 +292,18 @@ def _upload_item_images_to_wp_and_attach(wc_api, item, wc_product: dict) -> list
                 "custom_wp_alternative",
                 "creation",
                 "attached_to_field",
-            ],
+            ] + champs_de_rangement(),
             order_by="creation asc",
         )
 
         if not rows:
             return rows
+
+        # L'utilisateur a rangé les images de l'article (fenêtre « Images : ordre et site ») : son ordre fait foi,
+        # la première est l'image principale du produit sur le site.
+        ranges = ranger(rows)
+        if ranges is not None:
+            return ranges
 
         item_image = _norm_url(getattr(it, "image", "") or "")
         if not item_image:
@@ -335,13 +342,19 @@ def _upload_item_images_to_wp_and_attach(wc_api, item, wc_product: dict) -> list
             continue
         if not _is_image_url(url, f.get("file_name")):
             continue
+        if int(f.get("custom_hors_site") or 0) == 1:
+            continue            # « ne pas envoyer sur le site » : elle reste dans ERPNext, et quitte le produit du site
         treated_files.append(f)
 
     # (une fiche Fichier en double d'une image déjà traitée — même adresse — n'est pas « en attente »)
     adresses_traitees = {(f.get("file_url") or "").strip() for f in treated_files}
     en_attente = [f for f in file_rows if (f.get("file_url") or "").strip() and int(f.get("custom_treated_ai") or 0) != 1
                   and _is_image_url(f.get("file_url"), f.get("file_name"))
+                  and int(f.get("custom_hors_site") or 0) != 1
                   and (f.get("file_url") or "").strip() not in adresses_traitees]
+    hors_site = len({(f.get("file_url") or "").strip() for f in file_rows if int(f.get("custom_hors_site") or 0) == 1})
+    if hors_site:
+        suivi.noter("%d image(s) gardée(s) hors du site" % hors_site)
     if en_attente:
         suivi.avertir("%d image(s) en attente de retouche : non envoyée(s) au site." % len(en_attente))
 

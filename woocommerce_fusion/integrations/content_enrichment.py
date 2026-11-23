@@ -3029,7 +3029,30 @@ def generate_website_contenant(item_name: str) -> Dict[str, Any]:
         "images": images_res,
     }
 # Treat image file
+# Rangement des images par l'utilisateur (23/11/2026 : « l'ordre des images, même l'image principale, est-ce que je
+# peux le changer dans l'article et par conséquent sur le site », « sélectionner des images qui ne seront pas poussées
+# sur le site »). Deux champs sur la fiche Fichier, posés par la fenêtre « Images : ordre et site » de l'article :
+CHAMP_ORDRE = "custom_ordre_image"            # 1, 2, 3… ; 0 = jamais rangée (elle suit les autres, par date)
+CHAMP_HORS_SITE = "custom_hors_site"          # 1 = reste dans ERPNext, n'est pas envoyée sur le site
+
+
+def champs_de_rangement() -> list:
+    """Les champs de rangement qui existent sur ce site (ils sont créés par un patch)."""
+    return [c for c in (CHAMP_ORDRE, CHAMP_HORS_SITE) if _has_db_column("File", c)]
+
+
+def ranger(rows: list) -> list:
+    """L'ordre choisi par l'utilisateur, s'il en a choisi un : rang 1 en tête, les images jamais rangées à la suite par
+    date. None si aucune image n'a de rang. Pure."""
+    if not any(int(r.get(CHAMP_ORDRE) or 0) for r in rows):
+        return None
+    return sorted(rows, key=lambda r: (int(r.get(CHAMP_ORDRE) or 0) or 10 ** 6, str(r.get("creation") or "")))
+
+
 def _make_main_first(it, rows):
+    ranges = ranger(rows)
+    if ranges is not None:
+        return ranges
     # 1) prefer attached_to_field="image"
     for i, r in enumerate(rows):
         if r.get("attached_to_field") == "image":
@@ -3093,7 +3116,7 @@ def treat_left_item_images(item_name: str, max_images: int = 10, preserve_order:
         fields=[
             "name", "file_url", "file_name", "is_private", "creation", "attached_to_field",
             "custom_treated_ai", "custom_wp_title", "custom_wp_alternative"
-        ],
+        ] + champs_de_rangement(),
         order_by="is_private asc, creation asc",
         limit_page_length=500,
     )
@@ -3203,6 +3226,9 @@ def _remplacer_par_retouche(it, old_doc, new_bytes: bytes, rang: int, image_prin
     # mark new treated flag (on new file)
     if hasattr(new_doc, "custom_treated_ai"):
         new_doc.custom_treated_ai = 1
+    # la retouche prend la place de l'ancienne : même rang, même choix « pas sur le site »
+    for champ in champs_de_rangement():
+        setattr(new_doc, champ, old_doc.get(champ) or 0)
     new_doc.save(ignore_permissions=True)
 
     # OPTIONAL: keep ordering slot by copying creation timestamp
@@ -3267,7 +3293,8 @@ def images_de_l_article(item_name: str) -> list:
     it = frappe.get_doc("Item", item_name)
     rows = frappe.get_all(
         "File", filters={"attached_to_doctype": "Item", "attached_to_name": it.name, "is_folder": 0},
-        fields=["name", "file_url", "file_name", "is_private", "creation", "attached_to_field", "custom_treated_ai"],
+        fields=["name", "file_url", "file_name", "is_private", "creation", "attached_to_field", "custom_treated_ai"]
+               + champs_de_rangement(),
         order_by="is_private asc, creation asc", limit_page_length=500)
     rows = [r for r in rows if _is_image_url(r.get("file_url"), r.get("file_name"))]
     vues, uniques = set(), []
@@ -3279,8 +3306,31 @@ def images_de_l_article(item_name: str) -> list:
         uniques.append({"name": r["name"], "file_url": r["file_url"], "file_name": r["file_name"],
                         "traitee": int(r.get("custom_treated_ai") or 0),
                         "principale": int(r.get("attached_to_field") == "image" or (r["file_url"] or "").strip() == (it.image or "").strip()),
+                        "hors_site": int(r.get(CHAMP_HORS_SITE) or 0),
                         "avant_url": avant["file_url"] if avant else ""})
     return uniques
+
+
+def enregistrer_rangement(item_name: str, ordre: list, hors_site: list) -> dict:
+    """La fenêtre « Images : ordre et site » : `ordre` = les fichiers image de l'article dans l'ordre voulu (le premier
+    devient l'image principale de la fiche, donc du produit sur le site) ; `hors_site` = ceux qui restent dans ERPNext
+    sans partir sur le site. Les fiches Fichier en double (même adresse) suivent celle qui est rangée."""
+    if len(champs_de_rangement()) < 2:
+        frappe.throw("Les champs de rangement des images ne sont pas encore installés sur ce site (migration à passer).")
+    connues = {i["name"]: i for i in images_de_l_article(item_name)}
+    ordre = [n for n in (ordre or []) if n in connues]
+    ordre += [n for n in connues if n not in ordre]            # une image absente de la liste reçue garde une place
+    hors_site = {n for n in (hors_site or []) if n in connues}
+    for rang, nom in enumerate(ordre, start=1):
+        frappe.db.sql(
+            """update `tabFile` set {ordre} = %s, {hors} = %s,
+                      attached_to_field = case when %s = 1 then 'image' when attached_to_field = 'image' then null else attached_to_field end
+               where attached_to_doctype = 'Item' and attached_to_name = %s and file_url = %s""".format(ordre=CHAMP_ORDRE, hors=CHAMP_HORS_SITE),
+            (rang, 1 if nom in hors_site else 0, rang, item_name, connues[nom]["file_url"]))
+    principale = connues[ordre[0]]["file_url"] if ordre else ""
+    frappe.db.set_value("Item", item_name, "image", principale)
+    frappe.clear_document_cache("Item", item_name)
+    return {"ok": True, "item": item_name, "principale": principale, "images": len(ordre), "hors_site": len(hors_site)}
 
 
 def proposer_retouches(item_name: str, fichiers: list, consignes: dict | None = None) -> tuple:
@@ -3402,6 +3452,8 @@ def restaurer_images(item_name: str, fichiers: list) -> dict:
         valeurs = {"attached_to_doctype": "Item", "attached_to_name": it.name, "attached_to_field": actuel.attached_to_field}
         if _has_db_column("File", "custom_treated_ai"):
             valeurs["custom_treated_ai"] = 1            # elle repart sur le site telle qu'elle était
+        for champ in champs_de_rangement():
+            valeurs[champ] = actuel.get(champ) or 0     # à la même place, avec le même choix « pas sur le site »
         frappe.db.set_value("File", avant["name"], valeurs, update_modified=True)
         if actuel.attached_to_field == "image" or (actuel.file_url or "").strip() == image_principale:
             it.image = avant["file_url"]
