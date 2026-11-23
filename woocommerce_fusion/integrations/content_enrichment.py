@@ -29,6 +29,8 @@ from frappe.utils.file_manager import save_file
 
 from google import genai
 from google.genai import types as genai_types
+
+from woocommerce_fusion.tasks import suivi_synchro as suivi
 from woocommerce_fusion.tasks.utils import APIWithRequestLogging
 from woocommerce_fusion.integrations.item_images_treatment import _is_image_url, _detach_file_doc, dedupe_item_images
 
@@ -1892,7 +1894,18 @@ def _get_gemini_client() -> genai.Client:
     api_key = (getattr(doc, "gemini_api_key", None) or getattr(doc, "google_api_key", None) or "").strip()
     if not api_key:
         frappe.throw("Gemini API key missing in Single DocType 'AI settings' (gemini_api_key).")
-    return genai.Client(api_key=api_key)
+    return genai.Client(api_key=api_key, http_options=genai_types.HttpOptions(api_version=_gemini_api_version()))
+
+
+# ⚠️ La version du service est IMPOSÉE (23/11/2026). La bibliothèque google-genai 3.x parle par défaut à « v1 », où les
+# modèles « preview » (dont gemini-3-pro-image-preview, celui du réglage) n'existent pas : toutes les retouches
+# répondaient 404 depuis la reconstruction de la prod. « v1beta » sert les modèles stables ET les preview.
+# Réglable sans déploiement : `gemini_api_version` dans site_config.json.
+GEMINI_API_VERSION = "v1beta"
+
+
+def _gemini_api_version() -> str:
+    return (frappe.conf.get("gemini_api_version") or GEMINI_API_VERSION).strip()
 
 
 def _get_openai_client() -> OpenAI:
@@ -2251,100 +2264,131 @@ def _ensure_wp_meta_for_file(
 # Gemini image edit
 # ---------------------------------------------------------------------------
 
+# La consigne (23/11/2026). L'ancienne demandait de REFAIRE un packshot en vue trois-quarts : une image cotée y
+# perdait ses cotes, une photo y changeait d'angle. Demandes de l'utilisateur : « lorsque l'image a des dimensions,
+# lui dire de les garder aussi dans la retouche » et « améliorer la qualité de l'image en plus d'enlever le
+# background ». Deux cas, que le modèle distingue lui-même :
+#   A. photo du produit  -> même produit, même angle, fond blanc, qualité améliorée ;
+#   B. image technique ou annotée (cotes, flèches, tableau, texte) -> la MÊME image, plus propre et plus nette, chaque
+#      chiffre et chaque trait conservés.
 EDIT_PROMPT = (
-    """You receive one or multiple photos of the SAME product.
-The product can be:
-- A water tank / cistern / reservoir
-- A valve / faucet
-- A pipe, PVC/PE fitting, connector, or plumbing accessory
+    """You receive ONE image of a product sold on a professional e-commerce website (water treatment equipment).
+First decide silently which of the two cases below applies, then follow ONLY the rules of that case.
 
-Your task:
-Generate ONE single, high-quality, professional e-commerce packshot
-of this exact product.
+CASE A - PRODUCT PHOTO
+(a photograph of the product, with or without a background, WITHOUT technical annotations)
+Goal: a clean, high-quality packshot of this EXACT product.
+- Keep the product strictly identical: shape, geometry, proportions, capacity, ports, flanges, thread types,
+  handles, surface texture, colors, logos, labels, engravings, graduations and markings.
+- Do NOT invent, redesign, simplify, add or remove any part.
+- Keep the SAME viewpoint and orientation as in the original photo.
+- Remove the background: pure white seamless studio background (#FFFFFF), no texture, no environment,
+  no props, no people.
+- Improve the image quality: correct exposure and white balance, remove noise, blur and JPEG compression
+  artifacts, restore sharp edges and fine details, remove dust, stains and stray reflections that are not part
+  of the product, use soft and even studio lighting with a soft realistic shadow under the product.
+- The entire product must be visible (no cropped edges), centered, undistorted, filling about 85-90% of a
+  square 1:1 frame with even white margins.
+- Do NOT add any text, watermark or graphic.
 
-Reference usage:
-- Carefully analyze the input photo(s).
-- Reproduce the EXACT same product.
-- Preserve 100% of the original:
-  shape, geometry, proportions, capacity, ports, flanges,
-  thread types, valve handle design, surface texture,
-  colors, logos, labels, engravings, graduations and markings.
-- If multiple images are provided, combine them to improve accuracy.
-- Do NOT invent, redesign, simplify, or modify the product.
+CASE B - TECHNICAL OR ANNOTATED IMAGE
+(dimension drawing, or any image showing dimension lines, arrows, measurements, units, callouts, part numbers,
+tables, legends or text that describes the product)
+Goal: the SAME image, cleaner and sharper. This information is essential for the customer.
+- Keep EVERY dimension line, arrow, number, unit, symbol, callout, label, table and text exactly as in the
+  original: same values, same spelling, same language, same position.
+- NEVER remove, move, translate, round, retype or invent any of them.
+- Do NOT change the viewpoint, the layout or the composition. Do NOT redraw the product from another angle.
+- Only: make the background pure white, remove noise and compression artifacts, sharpen the lines and the text
+  so that every figure is perfectly legible, and increase the resolution.
+- Keep the whole image visible in a square 1:1 frame: add white margins instead of cropping.
+- If you cannot guarantee that every number and label stays identical, return the original image unchanged,
+  with only its background made pure white.
 
-View and framing:
-- Show the product in a clean 3/4 angled front view.
-- The entire product must be fully visible (no cropped edges).
-- Keep correct proportions (no distortion or stretching).
-- Center the product.
-- Use a square 1:1 format.
-- The product should fill about 85–90% of the frame
-  with small, even white margins around it.
-
-Background and lighting:
-- Pure white seamless studio background (#FFFFFF).
-- Soft, professional studio lighting.
-- Even illumination with no harsh reflections.
-- Soft, realistic shadow underneath and slightly behind the product.
-- No background texture.
-
-Restrictions:
-- Do NOT add extra elements.
-- No environment, no room, no installation context.
-- No people.
-- No additional text or graphics.
-- No watermarks.
-- No decorative props.
-
-Final result:
-A sharp, photorealistic, studio-quality 3/4 front view product packshot,
-accurately matching the reference product,
-ready for use on a professional e-commerce website."""
+In both cases: return ONE image only, photorealistic and sharp, ready for a professional e-commerce website.
+Do not return any text."""
 )
+
+# Haute définition demandée au modèle (2000 px de côté à la sortie) ; si le modèle réglé refuse ces options, la
+# retouche est retentée sans elles.
+IMAGE_SORTIE = {"aspect_ratio": "1:1", "image_size": "2K"}
+
+
+def _config_retouche():
+    try:
+        return genai_types.GenerateContentConfig(
+            response_modalities=["IMAGE"], image_config=genai_types.ImageConfig(**IMAGE_SORTIE))
+    except Exception:
+        return None            # bibliothèque trop ancienne pour ces options : appel simple
+
+
+def raison_echec_retouche(erreur) -> str:
+    """Pourquoi la retouche a échoué, en une phrase pour l'utilisateur. Pure."""
+    texte = str(erreur or "")
+    bas = texte.lower()
+    if "404" in texte or "not_found" in bas or "is not found" in bas:
+        return "le modèle Gemini réglé dans « AI Settings » est introuvable chez Google"
+    if "401" in texte or "403" in texte or "api key" in bas or "permission_denied" in bas or "unauthenticated" in bas:
+        return "la clé Gemini est refusée par Google"
+    if "429" in texte or "resource_exhausted" in bas or "quota" in bas:
+        return "le quota Gemini est dépassé"
+    if "aucune image" in bas:
+        return "Gemini n’a renvoyé aucune image (refus ou filtre de sécurité)"
+    premiere = next((l.strip() for l in texte.splitlines() if l.strip()), "erreur inconnue")
+    return premiere[:200]
+
+
+def _image_de_la_reponse(resp):
+    for cand in getattr(resp, "candidates", []) or []:
+        content = getattr(cand, "content", None)
+        for part in (getattr(content, "parts", None) or []):
+            if getattr(part, "inline_data", None) and getattr(part.inline_data, "mime_type", ""):
+                return Image.open(io.BytesIO(part.inline_data.data))
+    return None
+
+
+def _gemini_retoucher(client: genai.Client, img_bytes: bytes) -> tuple:
+    """Retouche une image. Renvoie (octets WEBP carrés 2000×2000, réussie, raison de l'échec).
+
+    En cas d'échec, les octets sont l'image d'ORIGINE mise au carré : à l'appelant de décider quoi en faire — elle ne
+    doit pas être prise pour une image retouchée."""
+    base_im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    modele = _read_gemini_model(purpose="image")
+    derniere = None
+    essais = [c for c in (_config_retouche(), None)]
+    if essais[0] is None:
+        essais = [None]
+    for config in essais:
+        try:
+            if config is not None:
+                resp = client.models.generate_content(model=modele, contents=[base_im, EDIT_PROMPT], config=config)
+            else:
+                resp = client.models.generate_content(model=modele, contents=[base_im, EDIT_PROMPT])
+            image = _image_de_la_reponse(resp)
+            if image is not None:
+                return _pil_to_webp_square_bytes(image, size=(2000, 2000), quality=88), True, ""
+            # No image returned (refusal, safety block, text-only model...). Log why.
+            finish = [getattr(c, "finish_reason", None) for c in (getattr(resp, "candidates", []) or [])]
+            texts = [part.text for cand in (getattr(resp, "candidates", []) or [])
+                     for part in (getattr(getattr(cand, "content", None), "parts", None) or []) if getattr(part, "text", None)]
+            frappe.log_error(
+                f"finish_reason={finish}\nprompt_feedback={getattr(resp, 'prompt_feedback', None)}\n"
+                f"text={' | '.join(texts)[:1000]}",
+                "gemini image edit: no image returned",
+            )
+            derniere = "aucune image renvoyée"
+        except Exception as e:
+            derniere = str(e)
+            if config is None or not ("400" in derniere or "INVALID_ARGUMENT" in derniere):
+                frappe.log_error(frappe.get_traceback(), "gemini image edit failed")
+                break            # un modèle introuvable ou une clé refusée ne passera pas mieux sans les options
+    return _pil_to_webp_square_bytes(base_im, size=(2000, 2000), quality=88), False, raison_echec_retouche(derniere)
 
 
 def _gemini_edit_image_bytes(client: genai.Client, img_bytes: bytes) -> bytes:
-    """
-    Ask Gemini to clean/center the product image.
-    Always returns WEBP square bytes (2000×2000).
-    """
-    base_im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-
-    try:
-        resp = client.models.generate_content(
-            model=_read_gemini_model(purpose="image"),
-            contents=[base_im, EDIT_PROMPT],
-        )
-
-        # Try extract inline image
-        for cand in getattr(resp, "candidates", []) or []:
-            content = getattr(cand, "content", None)
-            if not content:
-                continue
-            for part in content.parts:
-                if getattr(part, "inline_data", None) and getattr(part.inline_data, "mime_type", ""):
-                    raw = part.inline_data.data
-                    out_im = Image.open(io.BytesIO(raw))
-                    return _pil_to_webp_square_bytes(out_im, size=(2000, 2000), quality=88)
-
-        # No image returned (refusal, safety block, text-only model...). Log why
-        # instead of silently returning the padded original.
-        finish = [getattr(c, "finish_reason", None) for c in (getattr(resp, "candidates", []) or [])]
-        texts = []
-        for cand in getattr(resp, "candidates", []) or []:
-            content = getattr(cand, "content", None)
-            for part in (getattr(content, "parts", None) or []):
-                if getattr(part, "text", None):
-                    texts.append(part.text)
-        frappe.log_error(
-            f"finish_reason={finish}\nprompt_feedback={getattr(resp, 'prompt_feedback', None)}\n"
-            f"text={' | '.join(texts)[:1000]}",
-            "gemini image edit: no image returned",
-        )
-        return _pil_to_webp_square_bytes(base_im, size=(2000, 2000), quality=88)
-    except Exception:
-        frappe.log_error(frappe.get_traceback(), "gemini image edit failed")
-        return _pil_to_webp_square_bytes(base_im, size=(2000, 2000), quality=88)
+    """Ancienne entrée, gardée pour ses appelants : toujours des octets WEBP carrés, retouchés ou non.
+    Préférer `_gemini_retoucher`, qui dit si la retouche a réussi."""
+    return _gemini_retoucher(client, img_bytes)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -2869,6 +2913,7 @@ def generate_website_contenant(item_name: str) -> Dict[str, Any]:
 
 
     # --- step 1: SEO/content generation (writes custom fields on Item) ---
+    suivi.etape("textes")
     content_res = {}
     try:
         content_res = enrich_item_content_with_openai_search(
@@ -2888,12 +2933,17 @@ def generate_website_contenant(item_name: str) -> Dict[str, Any]:
     except Exception as e:
         frappe.log_error(frappe.get_traceback(), "generate_website_contenant: content generation failed")
         content_res = {"ok": False, "error": str(e)}
+        suivi.avertir("Textes du site non régénérés : " + (str(e).splitlines() or ["erreur"])[0][:200])
+    else:
+        suivi.noter("textes du site et SEO régénérés")
 
     # --- step 2: image retouch / ALT / website image ---
+    suivi.etape("images")
     images_res = {}
     try:
         dedupe_item_images(item_name=item_name, dry_run=False, detach_missing=True)
         images_res=treat_left_item_images(item_name=item_name)
+        reparer_image_principale(item_name)
         # images_res = retouch_item_images(
         #     item_name=item_name,
         #     max_images=MAX_IMAGES_RETOUCH,
@@ -2905,6 +2955,7 @@ def generate_website_contenant(item_name: str) -> Dict[str, Any]:
     except Exception as e:
         frappe.log_error(frappe.get_traceback(), "generate_website_contenant: image retouch failed")
         images_res = {"ok": False, "error": str(e)}
+        suivi.avertir("Images non traitées : " + (str(e).splitlines() or ["erreur"])[0][:200])
 
     return {
         "ok": bool(content_res.get("ok", True) and images_res.get("ok", True)),
@@ -2990,11 +3041,14 @@ def treat_left_item_images(item_name: str, max_images: int = 10, preserve_order:
     # first must be main image
     rows = _make_main_first(it, rows)
     rows = rows[: int(max_images)]
+    image_principale = (it.image or "").strip()
 
     actions = []
+    echecs = []            # raisons des retouches refusées
     i=0
     for r in rows:
         i+=1
+        suivi.etape("images", "image %d sur %d" % (i, len(rows)))
         old_id = r["name"]
         old_doc = frappe.get_doc("File", old_id)
             # ✅ Always ensure WP fields exist (independent from treated)
@@ -3019,8 +3073,13 @@ def treat_left_item_images(item_name: str, max_images: int = 10, preserve_order:
         old_bytes = old_doc.get_content()
 
         # treat with gemini
-        new_bytes = _gemini_edit_image_bytes(gemini_client, old_bytes)
-        # new_bytes, ext = gemini_treat_image_bytes(gemini_client, old_bytes)
+        new_bytes, retouchee, raison = _gemini_retoucher(gemini_client, old_bytes)
+        if not retouchee:
+            # ⚠️ Retouche refusée (23/11/2026) : avant, l'image d'origine était quand même enregistrée comme
+            # « traitée » et partait sur le site sans retouche, sans rien dire. Désormais l'image reste telle quelle,
+            # NON marquée traitée : elle n'est pas envoyée au site et sera retentée à la prochaine synchronisation.
+            echecs.append(raison)
+            continue
         ext = ".jpg"
 
         # create NEW treated file attached to same item
@@ -3039,8 +3098,14 @@ def treat_left_item_images(item_name: str, max_images: int = 10, preserve_order:
             new_doc.save(ignore_permissions=True)
 
         # if old one was the 'image' field, update item.image to new url
-        if getattr(old_doc, "attached_to_field", None) == "image":
+        # (ou si c'est l'image principale reconnue à son adresse : sinon la fiche pointait sur le fichier détaché)
+        if getattr(old_doc, "attached_to_field", None) == "image" or (
+                image_principale and (old_doc.file_url or "").strip() == image_principale):
             it.image = new_doc.file_url
+            # Le fichier porte le champ « image » : sinon Frappe, à l'enregistrement de la fiche, crée une deuxième
+            # fiche Fichier pour la même adresse — non traitée, donc retouchée une seconde fois au passage suivant.
+            if getattr(new_doc, "attached_to_field", None) != "image":
+                new_doc.attached_to_field = "image"
 
         # copy WP fields if you already set them on old file
         for fld in ("custom_wp_title", "custom_wp_alternative"):
@@ -3076,7 +3141,46 @@ def treat_left_item_images(item_name: str, max_images: int = 10, preserve_order:
     it.save(ignore_permissions=True)
     frappe.db.commit()
 
-    return {"ok": True, "item": it.name, "treated_count": len(actions), "actions": actions}
+    if actions:
+        suivi.noter("%d image(s) retouchée(s)" % len(actions))
+    if echecs:
+        suivi.avertir("%d image(s) non retouchée(s) : %s. Elles ne sont pas envoyées au site et seront retentées à la "
+                      "prochaine synchronisation." % (len(echecs), echecs[0]))
+
+    return {"ok": True, "item": it.name, "treated_count": len(actions), "actions": actions,
+            "failed_count": len(echecs), "failed_reasons": sorted(set(echecs))}
+
+
+def reparer_image_principale(item_name: str):
+    """L'image principale de la fiche pointe-t-elle sur un fichier qui n'existe plus ? Elle est reposée sur la première
+    image jointe encore présente (ou vidée). Sans cela la fiche n'a plus de vignette et Frappe journalise « Error
+    Attaching File » à chaque enregistrement (Ad-MB-30L et Ad-MB-25L, 23/11/2026). Renvoie la nouvelle adresse, ou
+    None si rien n'était à réparer."""
+    from urllib.parse import unquote
+
+    def present(url):
+        url = unquote((url or "").strip())
+        if url.startswith("/files/"):
+            return os.path.isfile(frappe.get_site_path("public", url.lstrip("/")))
+        if url.startswith("/private/files/"):
+            return os.path.isfile(frappe.get_site_path(url.lstrip("/")))
+        return True            # adresse externe : on ne peut pas en juger, on la laisse
+
+    actuelle = (frappe.db.get_value("Item", item_name, "image") or "").strip()
+    if not actuelle or present(actuelle):
+        return None
+    candidates = frappe.get_all(
+        "File", filters={"attached_to_doctype": "Item", "attached_to_name": item_name, "is_folder": 0},
+        fields=["name", "file_url", "file_name", "attached_to_field"], order_by="creation asc", limit_page_length=200)
+    candidates = [c for c in candidates if _is_image_url(c.get("file_url"), c.get("file_name")) and present(c.get("file_url"))]
+    candidates.sort(key=lambda c: 0 if c.get("attached_to_field") == "image" else 1)
+    nouvelle = candidates[0]["file_url"] if candidates else ""
+    frappe.db.set_value("Item", item_name, "image", nouvelle, update_modified=False)
+    if candidates and candidates[0].get("attached_to_field") != "image":
+        # même raison que dans la retouche : sans le champ, Frappe recrée une fiche Fichier en double à l'enregistrement
+        frappe.db.set_value("File", candidates[0]["name"], "attached_to_field", "image", update_modified=False)
+    suivi.noter("image principale de la fiche réparée")
+    return nouvelle
 
 def estimate_weight_and_delivery_class(
     openai_client,

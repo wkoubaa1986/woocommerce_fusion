@@ -167,7 +167,7 @@ def _fetch_image_bytes(image_url: str) -> bytes:
 # -------------------------------
 # Upload to WordPress
 # -------------------------------
-def delete_media_by_ids(media_ids: dict) -> dict:
+def delete_media_by_ids(media_ids) -> dict:
     """
     Delete WordPress media based on dictionary keys (media IDs).
     
@@ -187,7 +187,9 @@ def delete_media_by_ids(media_ids: dict) -> dict:
         "total": len(media_ids)
     }
     
-    for media_id in media_ids.keys():
+    # ⚠️ L'appelant (tasks/sync_items.py) passe une LISTE d'identifiants : `.keys()` levait à chaque fois, et les
+    # anciennes images n'étaient jamais supprimées du site (constaté le 23/11/2026). Liste, ensemble ou dictionnaire.
+    for media_id in (list(media_ids.keys()) if isinstance(media_ids, dict) else list(media_ids or [])):
         try:
             # WordPress REST API endpoint to delete media
             delete_endpoint = f"{cfg.base_url}/wp-json/wp/v2/media/{media_id}"

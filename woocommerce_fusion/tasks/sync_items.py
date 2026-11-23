@@ -28,6 +28,7 @@ from woocommerce_fusion.woocommerce.woocommerce_api import (
 )
 # add to your imports
 from woocommerce_fusion.integrations import wp_media
+from woocommerce_fusion.tasks import suivi_synchro as suivi
 from woocommerce_fusion.integrations.content_enrichment import generate_website_contenant, classify_item_group, retouch_item_images, classify_item_collections, treat_left_item_images
 from woocommerce_fusion.integrations.item_images_treatment import dedupe_item_images, _is_image_url as _is_image_url_shared
 
@@ -336,6 +337,14 @@ def _upload_item_images_to_wp_and_attach(wc_api, item, wc_product: dict) -> list
             continue
         treated_files.append(f)
 
+    # (une fiche Fichier en double d'une image déjà traitée — même adresse — n'est pas « en attente »)
+    adresses_traitees = {(f.get("file_url") or "").strip() for f in treated_files}
+    en_attente = [f for f in file_rows if (f.get("file_url") or "").strip() and int(f.get("custom_treated_ai") or 0) != 1
+                  and _is_image_url(f.get("file_url"), f.get("file_name"))
+                  and (f.get("file_url") or "").strip() not in adresses_traitees]
+    if en_attente:
+        suivi.avertir("%d image(s) en attente de retouche : non envoyée(s) au site." % len(en_attente))
+
     # ERPNext set of "valid WP media ids" for this item
     erp_wp_ids: set[int] = set()
     for f in treated_files:
@@ -355,12 +364,14 @@ def _upload_item_images_to_wp_and_attach(wc_api, item, wc_product: dict) -> list
             )
         except Exception:
             frappe.log_error("WP Media delete failed", frappe.get_traceback())
+            suivi.avertir("%d ancienne(s) image(s) n’ont pas pu être supprimée(s) du site." % len(unused_on_wc))
 
     # -------- Upload / reuse media in order --------
     media_list: list[dict] = []
     images_payload: list[dict] = []
 
     for pos, f in enumerate(treated_files):
+        suivi.etape("images_site", "image %d sur %d" % (pos + 1, len(treated_files)))
         url_rel = (f.get("file_url") or "").strip()
         url_abs = _abs_erpnext_url(url_rel)
 
@@ -400,6 +411,7 @@ def _upload_item_images_to_wp_and_attach(wc_api, item, wc_product: dict) -> list
         except Exception as e:
             error_msg = f"Image sync failed for File={f.get('name')} url={url_abs}: {e}"
             frappe.log_error("WP Media upload/attach failed", f"{error_msg}\n\n{frappe.get_traceback()}")
+            suivi.avertir("Une image n’a pas pu être envoyée au site (%s)." % (f.get("file_name") or f.get("name")))
             continue
 
     # ✅ ADJUST 3: compute featured + additional ids for variation WPC
@@ -433,6 +445,9 @@ def _upload_item_images_to_wp_and_attach(wc_api, item, wc_product: dict) -> list
 
         except Exception:
             frappe.log_error("WC API product/variation image update failed", frappe.get_traceback())
+            suivi.avertir("Les images n’ont pas pu être rattachées au produit sur le site.")
+        else:
+            suivi.noter("%d image(s) sur le site" % len(images_payload))
 
     return media_list
 
@@ -580,6 +595,7 @@ class SynchroniseItem(SynchroniseWooCommerce):
 		Run synchronisation
 		"""
 		try:
+			suivi.etape("site")
 			self.get_corresponding_item_or_product()
 			self.sync_wc_product_with_erpnext_item()
 		except Exception as err:
@@ -671,6 +687,7 @@ class SynchroniseItem(SynchroniseWooCommerce):
 		Syncronise Item between ERPNext and WooCommerce
 		"""
 		if not(self.item.item.variant_of) and frappe.utils.cint(self.item.item.custom_generate_classification) == 1:
+			suivi.etape("classement", "groupe d’articles")
 			update=frappe.utils.cint(self.item.item.custom_force_regenerate_item_group)
 			classify_item_group(item_name=self.item.item.item_code,
 								update=update,            # 0 or 1
@@ -679,6 +696,7 @@ class SynchroniseItem(SynchroniseWooCommerce):
 								skip_root_if="All Item Groups")
 			self.item.item.reload()
 		if not(self.item.item.variant_of) and frappe.utils.cint(self.item.item.custom_generate_tag) == 1:
+			suivi.etape("classement", "collections")
 
 			
 			if not self.woocommerce_product:
@@ -708,6 +726,7 @@ class SynchroniseItem(SynchroniseWooCommerce):
 				generate_website_contenant(item_name=self.item.item.item_code)
 				self.item.item.reload()
 
+			suivi.etape("fiche")
 			if self.item and not self.woocommerce_product:
 				self.create_woocommerce_product(self.item)
 			elif self.item and self.woocommerce_product:
@@ -723,6 +742,7 @@ class SynchroniseItem(SynchroniseWooCommerce):
 
 				self.update_woocommerce_product(self.woocommerce_product, self.item)
 
+			suivi.etape("finitions")
 			# Sync item discount
 			sync_price=sync_single_item_discount(item_code=self.item.item.item_code)
 			# Sync item Brand and Unit of Measure
@@ -811,6 +831,7 @@ class SynchroniseItem(SynchroniseWooCommerce):
 					print(response.get("brands"))
 			except Exception as e:
 				frappe.log_error("WooCommerce Product Update Brand attribute Error", frappe.get_traceback())
+				suivi.avertir("Marque, catégories ou étiquettes non mises à jour sur le site : " + (str(e).splitlines() or ["erreur"])[0][:200])
 				return {
 					"status": "error",
 					"message": str(e)
@@ -894,6 +915,7 @@ class SynchroniseItem(SynchroniseWooCommerce):
 		self.woocommerce_product = wc_product
 		
 		wc_server=self.get_wc_api(self.woocommerce_product.woocommerce_server)
+		suivi.etape("images_site")
 		_upload_item_images_to_wp_and_attach(wc_server,item.item, wc_product)
 		self.set_sync_hash()
 
@@ -965,6 +987,7 @@ class SynchroniseItem(SynchroniseWooCommerce):
 			# NEW: upload Item images to WP & attach to this new Woo product
 			
 			wc_server=self.get_wc_api(self.woocommerce_product.woocommerce_server)
+			suivi.etape("images_site")
 			_upload_item_images_to_wp_and_attach(wc_server,item.item, wc_product)
 
 
