@@ -499,5 +499,47 @@ class TestComposerUneImage(unittest.TestCase):
 		self.assertIn("data-wcf-prendre", js)                    # les images d'un autre article
 
 
+
+class TestComposerDesImagesEnLot(unittest.TestCase):
+	"""La page « Composer des images » : photos sources proposées, lot en arrière-plan, validation (23/11/2026)."""
+
+	def test_pieces_d_un_adoucisseur_frp(self):
+		p = C.pieces_probables("Adoucisseur FRP 1035, 25 L de résine, Runxin F65B3", "<ul><li>Bac à sel séparé de 70 L.</li></ul>", ["Runxin F65B3", "Sans bypass"])
+		self.assertEqual(p, {"bouteille": "FRP-1035", "bac": "BT-70", "modeles": ["F65B3"]})
+
+	def test_tete_keman_et_kit_bypass(self):
+		p = C.pieces_probables("Adoucisseur FRP 1054, 40 L de résine, Keman ASD4-LCD", "Bac à sel séparé de 70 L.", ["Keman ASD4-LCD", "Inclus dans la tête"])
+		self.assertEqual((p["bouteille"], p["modeles"]), ("FRP-1054", ["ASD4-LCD"]))
+		p = C.pieces_probables("Adoucisseur FRP 1035, 30 L, Runxin F63B3, Avec kit bypass", "Cette variante comprend le kit bypass Runxin F70A (Rn-41104).", ["Runxin F63B3", "Avec kit bypass"])
+		self.assertEqual(p["modeles"][:2], ["F63B3", "F70A"])
+
+	def test_article_sans_piece_reconnue(self):
+		self.assertEqual(C.pieces_probables("Filtre à sédiments 5 microns", None, None), {"bouteille": None, "bac": None, "modeles": []})
+
+	def test_la_bouteille_n_est_pas_prise_pour_une_vanne(self):
+		self.assertNotIn("FRP1035", C.pieces_probables("Adoucisseur FRP1035", "", [])["modeles"])
+
+	def test_un_lot_compose_plusieurs_articles_en_meme_temps(self):
+		import inspect
+		source = inspect.getsource(C.proposer_compositions_par_article)
+		self.assertIn("ThreadPoolExecutor(max_workers=min(RETOUCHES_EN_PARALLELE", source)
+		self.assertNotIn("attached_to_doctype", source)              # des propositions seulement, jointes à rien
+
+	def test_la_page_et_son_serveur(self):
+		from woocommerce_fusion.tasks import composition_lot as L
+		for nom in ("articles", "images_de", "lancer", "etat", "valider"):
+			self.assertTrue(callable(getattr(L, nom)), nom)
+		self.assertEqual(L.LOT_MAX, 60)
+		base = os.path.join(RACINE, "woocommerce", "page", "composer_images")
+		with open(os.path.join(base, "composer_images.js"), encoding="utf-8") as f:
+			js = f.read()
+		for attendu in ('frappe.pages["composer-images"].on_page_load', 'this.M + "lancer"', 'this.M + "valider"', "data-garder"):
+			self.assertIn(attendu, js, attendu)
+		import json
+		with open(os.path.join(base, "composer_images.json"), encoding="utf-8") as f:
+			page = json.load(f)
+		self.assertEqual((page["name"], page["module"], page["standard"]), ("composer-images", "WooCommerce", "Yes"))
+
+
 if __name__ == "__main__":
 	unittest.main()

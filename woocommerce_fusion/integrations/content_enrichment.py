@@ -3580,6 +3580,67 @@ def proposer_retouches(item_name: str, fichiers: list, consignes: dict | None = 
     return propositions, echecs
 
 
+# Les pièces probables d'un article composé, lues dans son nom, sa description et ses attributs — pour PROPOSER les
+# photos sources dans la page « Composer des images » (l'utilisateur garde la main sur le choix).
+_BOUTEILLE = re.compile(r"\bFRP\s*-?\s*(\d{3,4})\b", re.I)
+_BAC = re.compile(r"bac\s+à\s+s(?:el|aumure)[^.\d]{0,40}?(\d{2,4})\s*L\b", re.I)
+_MODELE = re.compile(r"\b([A-Z]{1,4}\d{1,4}[A-Z]\d?(?:-[A-Z]{2,4})?|[A-Z]{2,4}\d-[A-Z]{2,4})\b")
+
+
+def pieces_probables(nom: str, description: str | None, attributs: list | None) -> dict:
+    """{"bouteille": "FRP-1035" ou None, "bac": "BT-70" ou None, "modeles": ["F65B3", …]}. Pure.
+
+    - « FRP 1035 » dans le nom -> le réservoir FRP-1035 ;
+    - « bac à sel séparé de 70 L » dans la description -> le bac BT-70 ;
+    - les références de vanne ou de kit (F65B3, ASD2-LCD, N130A3, F70B…) lues dans les attributs, le nom et la
+      description -> les articles qui portent cette référence dans leur nom."""
+    texte = " ".join(re.sub(r"<[^>]+>", " ", description or "").split())
+    m, b = _BOUTEILLE.search(nom or ""), _BAC.search(texte)
+    modeles = []
+    for source in list(attributs or []) + [nom or "", texte]:
+        for jeton in _MODELE.findall(source or ""):
+            if jeton not in modeles and not jeton.upper().startswith("FRP"):
+                modeles.append(jeton)
+    return {"bouteille": ("FRP-" + m.group(1)) if m else None, "bac": ("BT-" + b.group(1)) if b else None, "modeles": modeles[:4]}
+
+
+def _image_principale_en_source(code: str):
+    """La photo principale d'un article, comme photo source : {name, file_url, de} ou None."""
+    url = (frappe.db.get_value("Item", code, "image") or "").strip()
+    if not url or not _fichier_present(url):
+        return None
+    nom = frappe.db.get_value("File", {"file_url": url, "attached_to_doctype": "Item", "attached_to_name": code}, "name") \
+        or frappe.db.get_value("File", {"file_url": url}, "name")
+    return {"name": nom, "file_url": url, "de": code} if nom else None
+
+
+def sources_proposees(item_code: str) -> list:
+    """Les photos sources proposées pour composer l'image de cet article : sa bouteille, sa vanne, son bac à sel…"""
+    it = frappe.db.get_value("Item", item_code, ["item_name", "description"], as_dict=True)
+    if not it:
+        return []
+    attributs = frappe.get_all("Item Variant Attribute", filters={"parent": item_code, "parenttype": "Item"}, pluck="attribute_value")
+    pieces = pieces_probables(it.item_name, it.description, attributs)
+    codes = [c for c in (pieces["bouteille"],) if c and frappe.db.exists("Item", c)]
+    for modele in pieces["modeles"]:
+        trouve = frappe.db.sql(
+            """select name from `tabItem` where disabled = 0 and name != %s and ifnull(image, '') != ''
+               and ifnull(variant_of, '') = '' and (name = %s or item_name like %s)
+               order by (item_group like '%%anne%%') desc, char_length(item_name) asc limit 1""",
+            (item_code, modele, "%" + modele + "%"))
+        if trouve:
+            codes.append(trouve[0][0])
+    if pieces["bac"] and frappe.db.exists("Item", pieces["bac"]):
+        codes.append(pieces["bac"])
+    sources, vus = [], set()
+    for code in codes:
+        source = _image_principale_en_source(code)
+        if source and source["name"] not in vus:
+            vus.add(source["name"])
+            sources.append(source)
+    return sources[:COMPOSITION_SOURCES_MAX]
+
+
 def _sources_de_composition(sources: list) -> tuple:
     """(octets, adresses) des photos sources : des fiches Fichier d'autres articles, ou des images déposées par
     l'utilisateur. Les fichiers illisibles ou qui ne sont pas des images sont écartés."""
@@ -3599,30 +3660,51 @@ def _sources_de_composition(sources: list) -> tuple:
 
 
 def proposer_compositions(articles: list, sources: list, consigne: str | None = None, avancement=None) -> dict:
-    """Compose une image pour chaque article de `articles` à partir des mêmes photos `sources` (plusieurs articles en
-    même temps). Rien n'est joint aux articles : une proposition par article, à vérifier.
+    """Compose une image pour chaque article de `articles` à partir des MÊMES photos `sources`."""
+    return proposer_compositions_par_article({code: list(sources or []) for code in articles}, consigne, avancement)
+
+
+def proposer_compositions_par_article(travaux: dict, consigne: str | None = None, avancement=None) -> dict:
+    """Compose une image par article, chacun avec SES photos sources : `travaux` = {article: [fiches Fichier]}.
+    Plusieurs articles partent en même temps. Rien n'est joint aux articles : une proposition par article, à vérifier.
 
     `avancement(faits, total)` est appelé au fil de l'eau. Renvoie {article: proposition ou {"echec": raison}}."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    octets, adresses = _sources_de_composition(sources)
-    if not octets:
-        frappe.throw("Aucune photo source lisible : ajoutez au moins une image.")
-    client, modele = _get_gemini_client(), _read_gemini_model(purpose="image")
-    demandes = {}
-    for code in articles:
+    lues = {}            # une photo source sert souvent à plusieurs articles : on ne la lit qu'une fois
+
+    def photos(noms):
+        octets, adresses = [], []
+        for nom in (noms or [])[:COMPOSITION_SOURCES_MAX]:
+            if nom not in lues:
+                o, a = _sources_de_composition([nom])
+                lues[nom] = (o[0], a[0]) if o else None
+            if lues[nom]:
+                octets.append(lues[nom][0])
+                adresses.append(lues[nom][1])
+        return octets, adresses
+
+    sortie, prets = {}, {}
+    for code, noms in travaux.items():
         it = frappe.db.get_value("Item", code, ["item_name", "description"], as_dict=True)
-        if it:
-            demandes[code] = demande_de_composition(it.item_name, it.description, consigne, len(octets))
+        octets, adresses = photos(noms)
+        if not it:
+            sortie[code] = {"echec": "article introuvable"}
+        elif not octets:
+            sortie[code] = {"echec": "aucune photo source lisible"}
+        else:
+            prets[code] = (demande_de_composition(it.item_name, it.description, consigne, len(octets)), octets, adresses)
+    if not prets:
+        return sortie
+    client, modele = _get_gemini_client(), _read_gemini_model(purpose="image")
     resultats = {}
-    with ThreadPoolExecutor(max_workers=min(RETOUCHES_EN_PARALLELE, max(1, len(demandes)))) as fils:
-        futurs = {fils.submit(_composition_pure, client, modele, demande, octets): code for code, demande in demandes.items()}
+    with ThreadPoolExecutor(max_workers=min(RETOUCHES_EN_PARALLELE, len(prets))) as fils:
+        futurs = {fils.submit(_composition_pure, client, modele, demande, octets): code for code, (demande, octets, _a) in prets.items()}
         for n, futur in enumerate(as_completed(futurs), start=1):
             resultats[futurs[futur]] = futur.result()
             if avancement:
-                avancement(n, len(demandes))
-    sortie = {}
-    for code in demandes:
+                avancement(n, len(prets))
+    for code, (_demande, _octets, adresses) in prets.items():
         image, reussie, raison, journal = resultats[code]
         for titre, texte in journal:
             frappe.log_error(texte, titre)
