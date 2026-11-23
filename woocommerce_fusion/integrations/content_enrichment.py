@@ -2551,6 +2551,82 @@ def _retouche_zone_pure(client, modele: str, consigne: str, img_bytes: bytes, zo
     return _pil_to_webp_square_bytes(origine, size=(2000, 2000), quality=88), False, raison_echec_retouche(derniere), journal
 
 
+# ---------------------------------------------------------------------------
+# COMPOSER une image (23/11/2026 : « les articles qui n'ont pas d'image, je peux recomposer l'image en prenant plusieurs
+# images des produits, ou des images que j'ajoute moi-même — cas des FRP »)
+# ---------------------------------------------------------------------------
+# Un adoucisseur FRP se vend monté (bouteille + vanne + bac à sel) mais n'a pas de photo : on donne à Gemini les photos
+# des pièces et il compose le packshot de l'ensemble. Le résultat est TOUJOURS une proposition à vérifier : c'est une
+# image inventée.
+COMPOSITION_SOURCES_MAX = 6
+COMPOSITION_COTE_MAX = 1600            # les photos sources sont réduites à ce côté avant l'envoi
+
+COMPOSE_PROMPT = (
+    """You receive {n} reference photo(s) of real products or parts sold on a professional e-commerce website
+(water treatment equipment). Compose ONE packshot of this product:
+
+Product: {nom}
+{description}
+
+Instruction from the shop owner (it may be written in French):
+\"\"\"{consigne}\"\"\"
+
+Rules:
+- Use ONLY the parts shown in the reference photos. Reproduce each one faithfully: shape, proportions, colors,
+  materials, logos, displays, connectors. Do NOT invent, add, remove or redesign any part.
+- Assemble or arrange the parts as the instruction says. If it does not say, show them the way this product is
+  normally sold: assembled when the parts fit together, otherwise side by side at realistic relative sizes.
+- Pure white seamless studio background (#FFFFFF), soft even studio lighting, soft realistic shadow under the product.
+- The whole product must be visible, centered, undistorted, filling about 85-90% of a square 1:1 frame.
+- Do NOT add any text, dimension line, number, label, watermark or graphic.
+
+Return ONE image only, photorealistic and sharp. Do not return any text."""
+)
+CONSIGNE_COMPOSITION_DEFAUT = "Montre le produit complet, monté comme il est vendu."
+
+
+def demande_de_composition(nom: str, description: str | None, consigne: str | None, n: int) -> str:
+    """La consigne envoyée avec les photos sources. Pure."""
+    description = " ".join(re.sub(r"<[^>]+>", " ", description or "").split())[:500]
+    return COMPOSE_PROMPT.format(
+        n=n, nom=" ".join((nom or "").split())[:200],
+        description=("Description: " + description) if description else "",
+        consigne=" ".join((consigne or "").split())[:CONSIGNE_MAX] or CONSIGNE_COMPOSITION_DEFAUT)
+
+
+def _composition_pure(client, modele: str, demande: str, sources: list) -> tuple:
+    """Compose une image à partir des photos `sources` (octets). Comme `_retouche_pure` : (octets WEBP carrés
+    2000×2000 ou None, réussie, raison, à journaliser), sans rien toucher de Frappe."""
+    import traceback
+
+    images = []
+    for octets in sources[:COMPOSITION_SOURCES_MAX]:
+        im = Image.open(io.BytesIO(octets)).convert("RGB")
+        im.thumbnail((COMPOSITION_COTE_MAX, COMPOSITION_COTE_MAX), Image.LANCZOS)
+        images.append(im)
+    journal, derniere = [], None
+    essais = [c for c in (_config_retouche(), None)]
+    if essais[0] is None:
+        essais = [None]
+    for config in essais:
+        try:
+            if config is not None:
+                resp = client.models.generate_content(model=modele, contents=images + [demande], config=config)
+            else:
+                resp = client.models.generate_content(model=modele, contents=images + [demande])
+            image = _image_de_la_reponse(resp)
+            if image is not None:
+                return _pil_to_webp_square_bytes(image, size=(2000, 2000), quality=88), True, "", journal
+            derniere = "aucune image renvoyée"
+            journal.append(("gemini image edit: no image returned", "composition : aucune image"))
+        except Exception as e:
+            derniere = str(e)
+            if config is None or not ("400" in derniere or "INVALID_ARGUMENT" in derniere):
+                journal.append(("gemini image edit failed", traceback.format_exc()))
+                break
+    return None, False, raison_echec_retouche(derniere), journal
+
+
 def _gemini_retoucher(client: genai.Client, img_bytes: bytes, consigne: str | None = None) -> tuple:
     """Retouche une image. Renvoie (octets WEBP carrés 2000×2000, réussie, raison de l'échec).
     `consigne` : ce que l'utilisateur demande en plus pour cette image (retouche manuelle)."""
@@ -3504,6 +3580,83 @@ def proposer_retouches(item_name: str, fichiers: list, consignes: dict | None = 
     return propositions, echecs
 
 
+def _sources_de_composition(sources: list) -> tuple:
+    """(octets, adresses) des photos sources : des fiches Fichier d'autres articles, ou des images déposées par
+    l'utilisateur. Les fichiers illisibles ou qui ne sont pas des images sont écartés."""
+    octets, adresses = [], []
+    for nom in (sources or [])[:COMPOSITION_SOURCES_MAX]:
+        if not frappe.db.exists("File", nom):
+            continue
+        doc = frappe.get_doc("File", nom)
+        if not _is_image_url(doc.file_url, doc.file_name):
+            continue
+        try:
+            octets.append(doc.get_content())
+            adresses.append(doc.file_url)
+        except Exception:
+            continue
+    return octets, adresses
+
+
+def proposer_compositions(articles: list, sources: list, consigne: str | None = None, avancement=None) -> dict:
+    """Compose une image pour chaque article de `articles` à partir des mêmes photos `sources` (plusieurs articles en
+    même temps). Rien n'est joint aux articles : une proposition par article, à vérifier.
+
+    `avancement(faits, total)` est appelé au fil de l'eau. Renvoie {article: proposition ou {"echec": raison}}."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    octets, adresses = _sources_de_composition(sources)
+    if not octets:
+        frappe.throw("Aucune photo source lisible : ajoutez au moins une image.")
+    client, modele = _get_gemini_client(), _read_gemini_model(purpose="image")
+    demandes = {}
+    for code in articles:
+        it = frappe.db.get_value("Item", code, ["item_name", "description"], as_dict=True)
+        if it:
+            demandes[code] = demande_de_composition(it.item_name, it.description, consigne, len(octets))
+    resultats = {}
+    with ThreadPoolExecutor(max_workers=min(RETOUCHES_EN_PARALLELE, max(1, len(demandes)))) as fils:
+        futurs = {fils.submit(_composition_pure, client, modele, demande, octets): code for code, demande in demandes.items()}
+        for n, futur in enumerate(as_completed(futurs), start=1):
+            resultats[futurs[futur]] = futur.result()
+            if avancement:
+                avancement(n, len(demandes))
+    sortie = {}
+    for code in demandes:
+        image, reussie, raison, journal = resultats[code]
+        for titre, texte in journal:
+            frappe.log_error(texte, titre)
+        if not reussie:
+            sortie[code] = {"echec": raison}
+            continue
+        fiche = frappe.get_doc({"doctype": "File", "file_name": "proposition-%s-%s.webp" % (code, frappe.generate_hash(length=10)),
+                                "content": image, "is_private": 0})
+        fiche.insert(ignore_permissions=True)
+        sortie[code] = {"composition": 1, "ancien": None, "ancien_url": "", "sources": adresses,
+                        "proposition": fiche.name, "proposition_url": fiche.file_url,
+                        "consigne": " ".join((consigne or "").split())[:CONSIGNE_MAX], "zone": None}
+    frappe.db.commit()
+    return sortie
+
+
+def _ajouter_image_composee(it, octets: bytes) -> dict:
+    """L'image composée devient une image de l'article : principale s'il n'en avait pas, sinon à la suite."""
+    existantes = [r for r in frappe.get_all("File", filters={"attached_to_doctype": "Item", "attached_to_name": it.name, "is_folder": 0},
+                                            fields=["name", "file_url", "file_name"] + champs_de_rangement())
+                  if _is_image_url(r.get("file_url"), r.get("file_name"))]
+    fiche = save_file(fname="%s_%d.jpg" % (it.name, len(existantes) + 1), content=octets, dt="Item", dn=it.name, is_private=0)
+    if hasattr(fiche, "custom_treated_ai"):
+        fiche.custom_treated_ai = 1            # produite par l'IA et vérifiée : elle part sur le site telle quelle
+    if CHAMP_ORDRE in champs_de_rangement() and any(int(r.get(CHAMP_ORDRE) or 0) for r in existantes):
+        setattr(fiche, CHAMP_ORDRE, max(int(r.get(CHAMP_ORDRE) or 0) for r in existantes) + 1)
+    principale = not (it.image or "").strip()
+    if principale:
+        fiche.attached_to_field = "image"
+        it.image = fiche.file_url
+    fiche.save(ignore_permissions=True)
+    return {"new_file": fiche.name, "new_url": fiche.file_url, "principale": principale}
+
+
 def supprimer_propositions(propositions: list) -> None:
     """Les propositions non gardées (ou abandonnées) : la fiche Fichier et son fichier disparaissent."""
     for p in propositions or []:
@@ -3520,6 +3673,12 @@ def supprimer_propositions(propositions: list) -> None:
             frappe.log_error(title="Retouche : proposition non supprimée", message=frappe.get_traceback())
 
 
+def cle_de_proposition(p: dict) -> str:
+    """Ce qui désigne une proposition dans le choix de l'utilisateur : l'image qu'elle remplacerait, ou — pour une
+    image composée, qui ne remplace rien — la proposition elle-même. Pure."""
+    return p.get("ancien") or p.get("proposition")
+
+
 def appliquer_retouches(item_name: str, propositions: list, gardees: list) -> dict:
     """Retouche manuelle, second temps : les propositions que l'utilisateur a choisi de GARDER prennent la place de
     l'ancienne image ; les autres sont supprimées, l'ancienne image reste."""
@@ -3527,9 +3686,17 @@ def appliquer_retouches(item_name: str, propositions: list, gardees: list) -> di
     image_principale = (it.image or "").strip()
     actions = []
     for i, p in enumerate(propositions or [], start=1):
-        if p.get("ancien") not in (gardees or []):
+        if cle_de_proposition(p) not in (gardees or []):
             continue
         suivi.etape("application", "image %d sur %d" % (len(actions) + 1, len(gardees)))
+        if p.get("composition"):            # une image composée : elle s'ajoute aux images de l'article
+            if not frappe.db.exists("File", p["proposition"]):
+                suivi.avertir("L’image composée n’existe plus : elle n’a pas été ajoutée.")
+                continue
+            octets = frappe.get_doc("File", p["proposition"]).get_content()
+            supprimer_propositions([p])
+            actions.append(_ajouter_image_composee(it, octets))
+            continue
         if not frappe.db.exists("File", p["ancien"]) or not frappe.db.exists("File", p["proposition"]):
             suivi.avertir("Une image a changé entre-temps : sa retouche n’a pas été mise en place.")
             continue
@@ -3547,7 +3714,7 @@ def appliquer_retouches(item_name: str, propositions: list, gardees: list) -> di
     supprimer_propositions(propositions)
     frappe.db.commit()
     reparer_image_principale(item_name)
-    suivi.noter("%d retouche(s) gardée(s), %d refusée(s)" % (len(actions), len(propositions or []) - len(actions)))
+    suivi.noter("%d image(s) gardée(s), %d refusée(s)" % (len(actions), len(propositions or []) - len(actions)))
     return {"ok": True, "item": it.name, "treated_count": len(actions), "actions": actions}
 
 

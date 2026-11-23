@@ -52,7 +52,7 @@ class TestEtapes(unittest.TestCase):
 	def test_le_bandeau_dit_ce_qui_a_ete_lance(self):
 		self.assertEqual(S.LIBELLES["retouche"]["fait"], "Retouches prêtes")
 		self.assertEqual(S.LIBELLES["synchro"]["titre"], "Synchronisation avec le site")
-		self.assertEqual(set(S.LIBELLES), {"synchro", "retouche", "validation", "restauration"})
+		self.assertEqual(set(S.LIBELLES), {"synchro", "retouche", "composition", "validation", "restauration"})
 
 	def test_a_valider_n_est_pas_en_cours(self):
 		"""Des retouches qui attendent le choix de l'utilisateur ne bloquent rien et ne sont jamais « interrompues »."""
@@ -440,6 +440,63 @@ class TestRetoucheDUneZone(unittest.TestCase):
 		self.assertIn("choisir_zone(url, zone, suite)", js)
 		self.assertIn("zones: zones", js)
 		self.assertIn("pointerdown", js)
+
+
+
+class TestComposerUneImage(unittest.TestCase):
+	"""« Les articles qui n'ont pas d'image : recomposer l'image en prenant plusieurs images » (23/11/2026)."""
+
+	def test_la_demande_porte_le_produit_et_la_consigne(self):
+		d = C.demande_de_composition("Adoucisseur FRP 1035, 25 L", "<p>Tête <b>Runxin F65B3</b></p>", "la vanne sur la bouteille", 3)
+		self.assertIn("You receive 3 reference photo(s)", d)
+		self.assertIn("Product: Adoucisseur FRP 1035, 25 L", d)
+		self.assertIn("Description: Tête Runxin F65B3", d)
+		self.assertIn('"""la vanne sur la bouteille"""', d)
+		self.assertIn("Use ONLY the parts shown in the reference photos", d)
+		self.assertIn("Do NOT add any text, dimension line, number", d)
+
+	def test_sans_consigne_ni_description(self):
+		d = C.demande_de_composition("Bac", None, "", 1)
+		self.assertIn(C.CONSIGNE_COMPOSITION_DEFAUT, d)
+		self.assertNotIn("Description:", d)
+
+	def test_toutes_les_photos_partent_avec_la_demande(self):
+		client = mock.Mock()
+		client.models.generate_content.return_value = _Reponse(_image((0, 200, 0), (80, 80)))
+		octets, ok, raison, journal = C._composition_pure(client, "modele", "demande", [_image(), _image((1, 2, 3)), _image((9, 9, 9))])
+		self.assertTrue(ok)
+		self.assertEqual(Image.open(io.BytesIO(octets)).size, (2000, 2000))
+		contenus = client.models.generate_content.call_args.kwargs["contents"]
+		self.assertEqual(len(contenus), 4)                      # trois photos, puis la demande
+		self.assertEqual(contenus[-1], "demande")
+
+	def test_six_photos_au_plus(self):
+		client = mock.Mock()
+		client.models.generate_content.return_value = _Reponse(_image())
+		C._composition_pure(client, "modele", "demande", [_image()] * 9)
+		self.assertEqual(len(client.models.generate_content.call_args.kwargs["contents"]), C.COMPOSITION_SOURCES_MAX + 1)
+
+	def test_echec_sans_image(self):
+		client = mock.Mock()
+		client.models.generate_content.side_effect = RuntimeError("429 RESOURCE_EXHAUSTED")
+		octets, ok, raison, journal = C._composition_pure(client, "modele", "demande", [_image()])
+		self.assertEqual((octets, ok), (None, False))
+		self.assertIn("quota", raison)
+
+	def test_une_composition_s_ajoute_une_retouche_remplace(self):
+		self.assertEqual(C.cle_de_proposition({"ancien": "f1", "proposition": "p1"}), "f1")
+		self.assertEqual(C.cle_de_proposition({"ancien": None, "proposition": "p1", "composition": 1}), "p1")
+		import inspect
+		source = inspect.getsource(C.appliquer_retouches)
+		self.assertIn('if p.get("composition"):', source)
+		self.assertIn("_ajouter_image_composee(it, octets)", source)
+
+	def test_la_fenetre_existe(self):
+		with open(os.path.join(RACINE, "public", "js", "stock", "item.js"), encoding="utf-8") as f:
+			js = f.read()
+		self.assertIn('this.METHODE + "lancer_composition"', js)
+		self.assertIn("frappe.ui.FileUploader", js)              # ses propres images
+		self.assertIn("data-wcf-prendre", js)                    # les images d'un autre article
 
 
 if __name__ == "__main__":

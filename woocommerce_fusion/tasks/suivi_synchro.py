@@ -42,6 +42,7 @@ DUREE_JOB = 30 * 60
 ETAPES = {
     "attente": "En file d’attente",
     "retouche": "Retouche des images choisies",
+    "composition": "Composition de l’image",
     "application": "Mise en place des retouches gardées",
     "restauration": "Retour aux images d’avant",
     "site": "Lecture du produit sur le site",
@@ -78,8 +79,9 @@ LIBELLES = {
     "synchro": {"titre": "Synchronisation avec le site", "fait": "Synchronisé avec le site",
                 "rate": "La synchronisation avec le site a échoué"},
     "retouche": {"titre": "Retouche des images", "fait": "Retouches prêtes", "rate": "La retouche des images a échoué"},
-    "validation": {"titre": "Mise en place des retouches", "fait": "Retouches mises en place",
-                   "rate": "La mise en place des retouches a échoué"},
+    "composition": {"titre": "Composition d’une image", "fait": "Image composée", "rate": "La composition de l’image a échoué"},
+    "validation": {"titre": "Mise en place des images gardées", "fait": "Images mises en place",
+                   "rate": "La mise en place des images a échoué"},
     "restauration": {"titre": "Retour aux images d’avant", "fait": "Images d’avant remises",
                      "rate": "Le retour aux images d’avant a échoué"},
 }
@@ -284,17 +286,45 @@ def valider_retouches(item_code: str, gardees=None) -> dict:
     actuel = _lire(item_code)
     if not actuel or actuel.get("etat") != A_VALIDER:
         frappe.throw(_("Aucune retouche n’attend de validation pour cet article."))
+    from woocommerce_fusion.integrations.content_enrichment import cle_de_proposition
     gardees = frappe.parse_json(gardees) if isinstance(gardees, str) else list(gardees or [])
     propositions = actuel.get("propositions") or []
-    gardees = [g for g in gardees if g in {p["ancien"] for p in propositions}]
+    gardees = [g for g in gardees if g in {cle_de_proposition(p) for p in propositions}]
     if not gardees:            # tout est refusé : rien à faire d'autre que jeter les propositions
         _jeter_les_propositions(item_code)
-        actuel.update(etat="terminee", fin=str(now_datetime()), propositions=[], fait="Retouches refusées",
-                      resume=["aucune retouche gardée : les images restent telles qu’elles étaient"])
+        actuel.update(etat="terminee", fin=str(now_datetime()), propositions=[], fait="Propositions refusées",
+                      resume=["aucune image gardée : l’article reste tel qu’il était"])
         return _ecrire(actuel)
     synchroniser = cint(actuel.get("synchroniser"))
     return _mettre_en_file(item_code, "validation", etapes_apres("application", item, bool(synchroniser)), "executer_validation",
                            propositions=propositions, gardees=gardees, synchroniser=synchroniser)
+
+
+def _sources(sources) -> list:
+    """Les photos sources d'une composition : des fiches Fichier que l'utilisateur a le droit de lire."""
+    sources = frappe.parse_json(sources) if isinstance(sources, str) else list(sources or [])
+    lisibles = []
+    for nom in sources:
+        if frappe.db.exists("File", nom) and frappe.has_permission("File", "read", nom):
+            lisibles.append(nom)
+    if not lisibles:
+        frappe.throw(_("Ajoutez au moins une photo source."))
+    return lisibles
+
+
+@frappe.whitelist()
+def lancer_composition(item_code: str, sources, consigne: str | None = None, synchroniser: int | str = 1) -> dict:
+    """« Composer une image » : une image de l'article est composée à partir de photos d'autres articles ou d'images
+    déposées (`sources` = noms de fiches Fichier). Le résultat attend sa validation, comme une retouche."""
+    _article(item_code)
+    sources = _sources(sources)
+    occupe = _occupe(item_code)
+    if occupe:
+        return occupe
+    _jeter_les_propositions(item_code)
+    return _mettre_en_file(item_code, "composition", ["composition"], "executer_composition",
+                           en_plus={"synchroniser": cint(cint(synchroniser) and _a_un_site(item_code))},
+                           sources=sources, consigne=(consigne or "").strip())
 
 
 @frappe.whitelist()
@@ -370,6 +400,20 @@ def executer_propositions(item_code: str, fichiers: list, consignes: dict | None
         if not propositions:
             return {"fait": "Aucune retouche obtenue"}
         return {"etat": A_VALIDER, "propositions": propositions}
+
+    _travailler(item_code, travail)
+
+
+def executer_composition(item_code: str, sources: list, consigne: str = "") -> None:
+    from woocommerce_fusion.integrations.content_enrichment import proposer_compositions
+
+    def travail():
+        etape("composition")
+        resultat = proposer_compositions([item_code], sources, consigne).get(item_code) or {"echec": "article introuvable"}
+        if resultat.get("echec"):
+            avertir("Image non composée : %s." % resultat["echec"])
+            return {"fait": "Aucune image obtenue"}
+        return {"etat": A_VALIDER, "propositions": [resultat]}
 
     _travailler(item_code, travail)
 

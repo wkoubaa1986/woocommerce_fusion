@@ -20,6 +20,11 @@ frappe.ui.form.on('Item', {
 			frm.trigger("sync_item_images");
 		}, __('Actions'));
 
+		// Composer une image à partir de photos d'autres articles ou d'images déposées (articles sans image)
+		frm.add_custom_button(__("Composer une image avec l’IA…"), function () {
+			wcf_synchro.fenetre_composition(frm);
+		}, __('Actions'));
+
 		// Ordre des images, image principale, images gardées hors du site
 		frm.add_custom_button(__("Images : ordre et site…"), function () {
 			wcf_synchro.fenetre_rangement(frm);
@@ -140,7 +145,7 @@ const wcf_synchro = {
 		if (e.etat === "a_valider") {
 			const n = (e.propositions || []).length;
 			return { genre: "attention", a_valider: true,
-				titre: "🖼️ " + n + " " + __("retouche(s) prête(s) : à vérifier avant de les garder"),
+				titre: "🖼️ " + n + " " + __("image(s) prête(s) : à vérifier avant de les garder"),
 				lignes: [__("Rien n’a encore été remplacé, rien n’est parti sur le site.")].concat(avert.map((a) => "⚠️ " + a)) };
 		}
 		if (!e.fin || sec(e.fin, maintenant) > this.GARDER_H * 3600) return null;
@@ -185,7 +190,7 @@ const wcf_synchro = {
 		$b.css({ background: couleurs[0], "border-color": couleurs[1], color: couleurs[2] }).html(`
 			<div style="display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap">
 				<div style="flex:1 1 260px;font-weight:700">${esc(vue.titre)}${vue.depuis ? ` <span style="font-weight:400;opacity:.8">· ${esc(vue.depuis)}</span>` : ""}</div>
-				${vue.a_valider ? `<button class="btn btn-xs btn-primary" data-wcf="verifier">${__("Vérifier les retouches")}</button>`
+				${vue.a_valider ? `<button class="btn btn-xs btn-primary" data-wcf="verifier">${__("Vérifier")}</button>`
 					: fini ? `<button class="btn btn-xs btn-default" data-wcf="relancer">${__("Relancer")}</button>
 					<button class="btn btn-xs btn-default" data-wcf="masquer">${__("Masquer")}</button>` : ""}
 			</div>
@@ -252,6 +257,86 @@ const wcf_synchro = {
 	lancer(frm) {
 		this.enregistrer_puis(frm, () => frappe.call({ method: this.METHODE + "lancer", args: { item_code: frm.doc.name } })
 			.then((r) => this.parti(frm, r.message)));
+	},
+
+	/**
+	 * « Composer une image » (23/11/2026 : « les articles qui n'ont pas d'image, je peux recomposer l'image en prenant
+	 * plusieurs images des produits, ou des images que j'ajoute moi-même »). On réunit des photos sources — images
+	 * d'autres articles, ou fichiers déposés —, on écrit la consigne, et l'IA propose une image. Elle n'est ajoutée à
+	 * l'article qu'après vérification.
+	 */
+	fenetre_composition(frm) {
+		const esc = frappe.utils.escape_html;
+		const sources = []; // [{ name, file_url }]
+		const MAX = 6;
+		const d = new frappe.ui.Dialog({
+			title: __("Composer une image avec l’IA"),
+			size: "large",
+			fields: [
+				{ fieldtype: "HTML", fieldname: "choisies" },
+				{ fieldtype: "Link", fieldname: "article", options: "Item", label: __("Prendre des images d’un autre article"),
+					onchange: () => montrer_article(d.get_value("article")) },
+				{ fieldtype: "HTML", fieldname: "dispo" },
+				{ fieldtype: "Button", fieldname: "deposer", label: __("Ajouter mes propres images"), click: () => deposer() },
+				{ fieldtype: "Small Text", fieldname: "consigne", label: __("Consigne (facultatif)"),
+					description: __("Exemples : « la vanne montée sur la bouteille, le bac à sel à droite », « vue de face ». Sans consigne : le produit complet, monté comme il est vendu.") },
+				{ fieldtype: "Check", fieldname: "synchroniser", label: __("Envoyer l’article sur le site une fois l’image validée"), default: 1 },
+			],
+			primary_action_label: __("Composer, puis me montrer le résultat"),
+			primary_action: (v) => {
+				if (!sources.length) {
+					frappe.show_alert({ message: __("Ajoutez au moins une photo source."), indicator: "orange" }, 4);
+					return;
+				}
+				d.hide();
+				this.enregistrer_puis(frm, () => frappe.call({
+					method: this.METHODE + "lancer_composition",
+					args: { item_code: frm.doc.name, sources: sources.map((x) => x.name), consigne: v.consigne || "", synchroniser: v.synchroniser ? 1 : 0 },
+				}).then((r) => this.parti(frm, r.message)));
+			},
+		});
+		const vignette = (x, action, signe) => `
+			<div style="position:relative;border:1px solid var(--border-color);border-radius:8px;padding:4px;background:#fff;cursor:pointer" ${action}="${esc(x.name)}" data-url="${esc(x.file_url)}">
+				<img src="${esc(x.file_url)}" style="width:100%;height:96px;object-fit:contain" loading="lazy">
+				<span style="position:absolute;top:2px;right:6px;font-weight:800">${signe}</span>
+			</div>`;
+		const grille = (contenu) => `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:8px">${contenu}</div>`;
+		const redessiner = () => d.fields_dict.choisies.$wrapper.html(`
+			<div style="font-weight:700;margin-bottom:6px">${__("Photos sources")} (${sources.length} / ${MAX})</div>
+			${sources.length ? grille(sources.map((x) => vignette(x, "data-wcf-retirer", "×")).join(""))
+				: `<div style="color:var(--text-muted);margin-bottom:6px">${__("Aucune pour l’instant : prenez-les sur d’autres articles (la bouteille, la vanne, le bac à sel…) ou ajoutez vos propres images.")}</div>`}`);
+		const ajouter = (x) => {
+			if (sources.some((y) => y.name === x.name)) return;
+			if (sources.length >= MAX) {
+				frappe.show_alert({ message: __("Six photos sources au plus."), indicator: "orange" }, 4);
+				return;
+			}
+			sources.push(x);
+			redessiner();
+		};
+		const montrer_article = (code) => {
+			const $z = d.fields_dict.dispo.$wrapper;
+			if (!code) { $z.empty(); return; }
+			frappe.call({ method: this.METHODE + "images", args: { item_code: code } }).then((r) => {
+				const images = r.message || [];
+				$z.html(images.length
+					? `<div style="color:var(--text-muted);margin-bottom:6px">${__("Cliquez sur une image pour la prendre.")}</div>` + grille(images.map((x) => vignette(x, "data-wcf-prendre", "+")).join(""))
+					: `<div style="color:var(--text-muted)">${__("Cet article n’a aucune image.")}</div>`);
+			});
+		};
+		const deposer = () => new frappe.ui.FileUploader({
+			allow_multiple: true,
+			restrictions: { allowed_file_types: ["image/*"] },
+			on_success: (fichier) => ajouter({ name: fichier.name, file_url: fichier.file_url }),
+		});
+		d.$wrapper.on("click", "[data-wcf-prendre]", (ev) => ajouter({ name: $(ev.currentTarget).attr("data-wcf-prendre"), file_url: $(ev.currentTarget).attr("data-url") }));
+		d.$wrapper.on("click", "[data-wcf-retirer]", (ev) => {
+			const nom = $(ev.currentTarget).attr("data-wcf-retirer");
+			sources.splice(sources.findIndex((y) => y.name === nom), 1);
+			redessiner();
+		});
+		redessiner();
+		d.show();
 	},
 
 	/**
@@ -343,7 +428,7 @@ const wcf_synchro = {
 		if (!props.length) return;
 		if (this._validation && this._validation.display) this._validation.hide();
 		const d = new frappe.ui.Dialog({
-			title: __("Vérifier les retouches avant de les garder"),
+			title: __("Vérifier avant de garder"),
 			size: "extra-large",
 			fields: [{ fieldtype: "HTML", fieldname: "paires" }],
 			primary_action_label: __("Valider mon choix"),
@@ -363,8 +448,23 @@ const wcf_synchro = {
 					<img src="${esc(url)}" style="width:100%;max-height:360px;object-fit:contain;border:1px solid var(--border-color);border-radius:8px;background:#fff" loading="lazy"></a>
 			</div>`;
 		d.fields_dict.paires.$wrapper.html(`
-			<div style="margin-bottom:10px">${__("Comparez chaque image. Cochez « Garder la retouche » seulement si elle est juste : mêmes cotes, même produit, mêmes couleurs. Une retouche non cochée est jetée, l’image actuelle reste.")}</div>
-			${props.map((p, i) => `
+			<div style="margin-bottom:10px">${__("Comparez chaque image. Cochez « Garder » seulement si elle est juste : mêmes cotes, même produit, mêmes couleurs. Ce qui n’est pas coché est jeté, l’article reste tel qu’il est.")}</div>
+			${props.map((p, i) => p.composition ? `
+				<div style="border:1px solid var(--border-color);border-radius:10px;padding:10px;margin-bottom:12px">
+					<div style="margin-bottom:8px;font-size:12.5px"><b>${__("Votre consigne")} :</b> ${p.consigne ? esc(p.consigne) : `<span style="color:var(--text-muted)">${__("aucune")}</span>`}</div>
+					<div style="display:flex;gap:12px;align-items:flex-start">
+						<div style="flex:1 1 0;min-width:0">
+							<div style="font-size:11.5px;font-weight:700;color:var(--text-muted);margin-bottom:4px">${__("Photos sources")}</div>
+							<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(90px,1fr));gap:6px">
+								${(p.sources || []).map((u) => `<a href="${esc(u)}" target="_blank"><img src="${esc(u)}" style="width:100%;height:90px;object-fit:contain;border:1px solid var(--border-color);border-radius:6px;background:#fff" loading="lazy"></a>`).join("")}
+							</div>
+						</div>
+						${image(p.proposition_url, __("Image composée"))}
+					</div>
+					<label style="display:flex;align-items:center;gap:8px;margin:10px 0 0;font-weight:700;cursor:pointer">
+						<input type="checkbox" data-wcf-garder="${esc(p.proposition)}" style="margin:0"> ${__("Garder cette image")}
+					</label>
+				</div>` : `
 				<div style="border:1px solid var(--border-color);border-radius:10px;padding:10px;margin-bottom:12px">
 					<div style="margin-bottom:8px;font-size:12.5px"><b>${__("Votre consigne")} :</b> ${p.consigne ? esc(p.consigne) : `<span style="color:var(--text-muted)">${__("aucune (retouche habituelle)")}</span>`}
 						${p.zone ? ` · <b style="color:#b91c1c">✂ ${__("zone seulement : le reste de l’image n’a pas été touché")}</b>` : ""}</div>
